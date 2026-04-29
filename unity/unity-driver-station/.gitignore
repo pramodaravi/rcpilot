@@ -1,0 +1,18 @@
+Library/
+Temp/
+Obj/
+Build/
+Builds/
+Logs/
+UserSettings/
+MemoryCaptures/
+.vs/
+.idea/
+*.csproj
+*.sln
+*.user
+*.userprefs
+
+# Unity regenerates .meta files on open; we don't ship them with this
+# source-only distribution.
+*.meta

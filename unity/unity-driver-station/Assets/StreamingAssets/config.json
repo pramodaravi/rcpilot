@@ -1,0 +1,65 @@
+{
+  "network": {
+    "jetsonIp": "192.168.55.1",
+    "controlPort": 5005,
+    "telemetryPort": 5006,
+    "sendHz": 250
+  },
+  "video": {
+    "bridgeHost": "127.0.0.1",
+    "cam0Port": 9000,
+    "cam1Port": 0,
+    "texWidth": 960,
+    "texHeight": 540
+  },
+  "wheel": {
+    "steeringAxis": 0,
+    "throttleAxis": 2,
+    "brakeAxis": 3,
+    "steeringDeadzone": 0.02,
+    "triggersAreBiPolar": false,
+    "invertSteering": false,
+    "btnArm": 0,
+    "btnDisarm": 1,
+    "btnEstop": 2,
+    "btnReset": 3,
+    "btnToggleCam": 4,
+    "btnLapMark": 5,
+    "logDiscovery": false
+  },
+  "race": {
+    "targetLapCount": 5,
+    "minLapSeconds": 10.0,
+    "autoLapFromButton": true,
+    "driverName": "Driver 1",
+    "trackName": "Full Throttle Novi — Main Loop"
+  },
+  "hud": {
+    "showTelemetryOverlay": true,
+    "showInputsOverlay": true,
+    "showRaceHud": true,
+    "hudAlpha": 0.85
+  },
+  "audio": {
+    "engineSoundEnabled": true,
+    "masterVolume": 0.7,
+    "engineMinHz": 80.0,
+    "engineMaxHz": 420.0
+  },
+  "sim": {
+    "enabled": false,
+    "straightSpeedMps": 13.5,
+    "accelMps2": 9.0,
+    "brakeMps2": 18.0,
+    "maxSteerDeg": 35.0,
+    "wheelbaseM": 0.33,
+    "gripN": 35.0,
+    "drag": 1.2,
+    "trackWidthM": 4.0,
+    "trackName": "Novi — Main Loop (sim)"
+  },
+  "assists": {
+    "defaultLevel": 1,
+    "disabled": false
+  }
+}
