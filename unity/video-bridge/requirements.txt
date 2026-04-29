@@ -1,0 +1,10 @@
+# PyAV wraps FFmpeg; prebuilt wheels for macOS (both arm64 and x86_64), Linux,
+# and Windows. No external GStreamer install needed. 11.x bundles recent
+# FFmpeg 6.x, plenty for H.264 RTP decode.
+av>=11.0,<15.0
+
+# Pillow for JPEG encode — libjpeg under the hood, prebuilt Apple Silicon wheels.
+Pillow>=10.0
+
+# NumPy comes along with PyAV but we depend on it directly for frame buffers.
+numpy>=1.26
