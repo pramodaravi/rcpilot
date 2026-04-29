@@ -1,0 +1,9 @@
+# Runtime dependencies for rcpilot.
+# For development: `pip install -e .[dev,cockpit]`
+# This file is for environments without pyproject support (e.g., Jetson Ubuntu's stock pip).
+
+PyYAML>=6.0
+tomli>=2.0;python_version<"3.11"
+
+# Cockpit-only — install with `pip install pygame-ce` separately on cockpit machines.
+# pygame-ce==2.5.7
