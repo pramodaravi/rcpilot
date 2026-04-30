@@ -344,8 +344,10 @@ def main() -> int:
                    help="local address for incoming RTP UDP. auto binds to "
                         "the interface used to reach --jetson-ip; 0.0.0.0 "
                         "listens on all interfaces")
-    p.add_argument("--jetson-ip", default=os.getenv("RCPILOT_JETSON_IP", "192.168.55.1"),
-                   help="Jetson address used only for --rtp-bind auto routing")
+    p.add_argument("--jetson-ip", default=os.getenv("RCPILOT_JETSON_IP", "192.168.1.53"),
+                   help="Jetson address used only for --rtp-bind auto routing. "
+                        "Defaults to the bench Wi-Fi IP; override with "
+                        "RCPILOT_JETSON_IP or --jetson-ip 192.168.55.1 for USB-C")
     p.add_argument("--frame-format", choices=("raw", "jpeg"), default="raw",
                    help="Unity bridge payload format. raw is lowest latency on localhost; "
                         "jpeg is a compatibility fallback")

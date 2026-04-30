@@ -38,7 +38,7 @@ video:
     assert cfg.network.jetson_ip == "10.0.0.42"
     assert cfg.network.control_port == 9999
     # Unspecified keys keep their defaults.
-    assert cfg.network.cockpit_ip == "192.168.55.100"
+    assert cfg.network.cockpit_ip == "192.168.1.247"
     assert cfg.control.rate_hz == 125
     assert cfg.control.watchdog_ms == 200  # default
     assert cfg.video.encoder == "nvv4l2h264enc"
@@ -110,5 +110,5 @@ def test_default_yaml_in_repo_loads() -> None:
     cfg = config_module.load(default_yaml)
     assert isinstance(cfg, Config)
     # The default YAML mirrors the dataclass defaults — sanity-check a few.
-    assert cfg.network.jetson_ip == "192.168.55.1"
+    assert cfg.network.jetson_ip == "192.168.1.53"
     assert cfg.video.sensor_mode == 4

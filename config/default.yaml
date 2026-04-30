@@ -12,13 +12,14 @@
 # need to list the keys you want to override.
 
 network:
-  # Jetson's IP. Default is the USB-C virtual ethernet address JetPack
-  # auto-assigns when the Jetson is plugged into a host's USB-C port. Switch
-  # this to the Jetson's Wi-Fi or Ethernet IP for over-the-air bench testing.
-  jetson_ip: 192.168.55.1
-  # Cockpit's IP. Used as the udpsink target on the Jetson side. The Jetson
-  # offers 192.168.55.100 to the host over USB-C virtual ethernet by default.
-  cockpit_ip: 192.168.55.100
+  # Jetson's IP. Default is the bench Wi-Fi IP on the Starlink subnet. For
+  # cabled USB-C virtual ethernet bring-up, set this to 192.168.55.1 (the
+  # address JetPack auto-assigns over the USB-C link).
+  jetson_ip: 192.168.1.53
+  # Cockpit's IP. Used as the udpsink target on the Jetson side. Default is
+  # the bench Wi-Fi IP. For USB-C virtual ethernet bring-up, set this to
+  # 192.168.55.100.
+  cockpit_ip: 192.168.1.247
   control_port: 5005
   video_port: 5004
 

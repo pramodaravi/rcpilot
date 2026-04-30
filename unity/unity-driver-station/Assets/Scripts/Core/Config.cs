@@ -52,13 +52,13 @@ namespace RcPilot.Core
     public class NetworkConfig
     {
         // V0.2 defaults — match rcpilot/config/default.yaml on the Jetson side.
-        // 192.168.55.1 is the Jetson's USB-C virtual ethernet address used for
-        // bench bring-up; for actual Wi-Fi operation set this to the AP-assigned
-        // IP. controlPort 5005 is where the echo server listens; the cockpit's
+        // 192.168.1.53 is the Jetson's bench Wi-Fi IP on the Starlink subnet;
+        // set to 192.168.55.1 (USB-C virtual ethernet) for cabled bring-up.
+        // controlPort 5005 is where the echo server listens; the cockpit's
         // send socket is also where echoes come back, so we don't need a
         // separate echo port. telemetryPort is retained as a stub for the
         // future battery/IMU/ESC channel — currently unused.
-        public string jetsonIp = "192.168.55.1";
+        public string jetsonIp = "192.168.1.53";
         public int localControlPort = 5005;
         public int controlPort = 5005;
         public int telemetryPort = 5006;   // reserved; not bound in V1

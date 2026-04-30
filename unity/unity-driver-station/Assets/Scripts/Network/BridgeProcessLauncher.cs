@@ -50,8 +50,9 @@ namespace RcPilot.Network
         public string tcpBind = "127.0.0.1";
         [Tooltip("RTP UDP bind address. 'auto' uses the local route to jetsonIp.")]
         public string rtpBind = "auto";
-        [Tooltip("Jetson address used to auto-detect the local RTP bind address.")]
-        public string jetsonIp = "192.168.55.1";
+        [Tooltip("Jetson address used to auto-detect the local RTP bind address. " +
+                 "Bootstrapper overrides this from config.network.jetsonIp at runtime.")]
+        public string jetsonIp = "192.168.1.53";
         [Tooltip("Bridge payload format: raw is lowest latency on localhost; jpeg is fallback.")]
         public string frameFormat = "raw";
 

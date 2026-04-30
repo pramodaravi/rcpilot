@@ -13,12 +13,14 @@ Type=simple
 User=adm2n
 Group=adm2n
 WorkingDirectory=/home/adm2n/rcpilot
-# Cockpit IP for USB-C virtual ethernet bench bring-up. Override with
-# 'sudo systemctl edit rcpilot-video.service' to switch to a Wi-Fi IP for
-# over-the-air operation; create a drop-in with:
+# Cockpit IP for the Wi-Fi bench bring-up (Starlink subnet). If the cockpit
+# machine ever takes a different DHCP lease, override with a drop-in:
+#   sudo systemctl edit rcpilot-video.service
 #   [Service]
-#   Environment=RCPILOT_COCKPIT_IP=<your-wifi-cockpit-ip>
-Environment=RCPILOT_COCKPIT_IP=192.168.55.100
+#   Environment=RCPILOT_COCKPIT_IP=<new-cockpit-ip>
+# The previous USB-C cockpit IP was 192.168.55.100; switch back via a drop-in
+# if the Wi-Fi link is unavailable for a session.
+Environment=RCPILOT_COCKPIT_IP=192.168.1.247
 ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video.sh
 # Use Restart=always (not on-failure) because GStreamer reports an EOS as a
 # clean exit (code 0) even when NvArgusCameraSrc failed to open. on-failure

@@ -1,6 +1,6 @@
 {
   "network": {
-    "jetsonIp": "192.168.55.1",
+    "jetsonIp": "192.168.1.53",
     "localControlPort": 5005,
     "controlPort": 5005,
     "telemetryPort": 5006,

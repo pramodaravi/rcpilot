@@ -36,11 +36,13 @@ import yaml
 class NetworkConfig:
     """Where things live on the network."""
 
-    jetson_ip: str = "192.168.55.1"
-    """Jetson's address. Default is the USB-C virtual ethernet IP that JetPack auto-assigns."""
+    jetson_ip: str = "192.168.1.53"
+    """Jetson's address. Default is the bench Wi-Fi IP on the Starlink subnet.
+    Set to 192.168.55.1 (USB-C virtual ethernet) for cabled bench bring-up."""
 
-    cockpit_ip: str = "192.168.55.100"
-    """Cockpit's address as seen by the Jetson; used as the video udpsink target."""
+    cockpit_ip: str = "192.168.1.247"
+    """Cockpit's address as seen by the Jetson; used as the video udpsink target.
+    Set to 192.168.55.100 (USB-C virtual ethernet) for cabled bench bring-up."""
 
     control_port: int = 5005
     """UDP port for control packets (cockpit → car) and echoes (car → cockpit)."""
