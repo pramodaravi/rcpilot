@@ -9,6 +9,6 @@ rem Run from the unity-driver-station folder, OR double-click this file.
 setlocal
 set SCRIPT_DIR=%~dp0
 set PY=python
-echo [bridge.bat] starting cam0 (RTP :5004 -> JPEG TCP :9000)
-"%PY%" "%SCRIPT_DIR%bridge.py" --in-port 5004 --out-port 9000
+echo [bridge.bat] starting cam0 (RTP :5004 -> JPEG TCP :9000, quality preset)
+"%PY%" "%SCRIPT_DIR%bridge.py" --in-port 5004 --out-port 9000 --preset quality
 endlocal

@@ -1,6 +1,7 @@
 {
   "network": {
     "jetsonIp": "192.168.55.1",
+    "localControlPort": 5005,
     "controlPort": 5005,
     "telemetryPort": 5006,
     "sendHz": 250
@@ -9,13 +10,13 @@
     "bridgeHost": "127.0.0.1",
     "cam0Port": 9000,
     "cam1Port": 0,
-    "texWidth": 960,
-    "texHeight": 540
+    "texWidth": 1280,
+    "texHeight": 720
   },
   "wheel": {
     "steeringAxis": 0,
     "throttleAxis": 2,
-    "brakeAxis": 3,
+    "brakeAxis": 8,
     "steeringDeadzone": 0.02,
     "triggersAreBiPolar": false,
     "invertSteering": false,
@@ -25,7 +26,7 @@
     "btnReset": 3,
     "btnToggleCam": 4,
     "btnLapMark": 5,
-    "logDiscovery": true
+    "logDiscovery": false
   },
   "race": {
     "targetLapCount": 5,

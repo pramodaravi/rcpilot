@@ -59,6 +59,7 @@ namespace RcPilot.Core
         // separate echo port. telemetryPort is retained as a stub for the
         // future battery/IMU/ESC channel — currently unused.
         public string jetsonIp = "192.168.55.1";
+        public int localControlPort = 5005;
         public int controlPort = 5005;
         public int telemetryPort = 5006;   // reserved; not bound in V1
         public int sendHz = 250;            // matches rcpilot/cockpit/control_sender.py
@@ -77,8 +78,8 @@ namespace RcPilot.Core
         public string bridgeHost = "127.0.0.1";
         public int cam0Port = 9000;
         public int cam1Port = 0;            // V1: single camera; set >0 to enable cam1
-        public int texWidth = 960;
-        public int texHeight = 540;
+        public int texWidth = 1280;
+        public int texHeight = 720;
     }
 
     [Serializable]

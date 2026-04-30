@@ -96,29 +96,61 @@ namespace RcPilot.Video
                 new Vector3(0.9f, 0.5f, 1f), cam1Tex);
             secondaryScreenRenderer = secondaryScreen.GetComponent<MeshRenderer>();
 
-            // Dashboard — dark matte slab below the main screen for the HUD to sit on.
-            BuildMatteSlab("Dashboard", cockpitRoot.transform,
-                new Vector3(0, 0.65f, 1.3f), new Vector3(-22f, 0, 0),
-                new Vector3(3.2f, 0.9f, 1f), new Color(0.05f, 0.06f, 0.08f));
+            // Floor — dark closure below the cockpit so the lower edge of the
+            // view doesn't leak the bare scene background.
+            BuildMatteSlab("Floor", cockpitRoot.transform,
+                new Vector3(0f, 0.05f, 0.7f), new Vector3(90f, 0, 0),
+                new Vector3(3.6f, 2.6f, 1f), new Color(0.018f, 0.018f, 0.022f));
 
-            // Wrap-around cockpit shell — cheap cylinder-ish feel from three slabs.
-            BuildMatteSlab("PillarL", cockpitRoot.transform,
-                new Vector3(-1.5f, 1.3f, 1.5f), new Vector3(0, 25f, 0),
-                new Vector3(0.6f, 2.0f, 1f), new Color(0.08f, 0.08f, 0.1f));
-            BuildMatteSlab("PillarR", cockpitRoot.transform,
-                new Vector3(1.5f, 1.3f, 1.5f), new Vector3(0, -25f, 0),
-                new Vector3(0.6f, 2.0f, 1f), new Color(0.08f, 0.08f, 0.1f));
-            BuildMatteSlab("Ceiling", cockpitRoot.transform,
-                new Vector3(0, 2.2f, 1.5f), new Vector3(60f, 0, 0),
-                new Vector3(3.0f, 1.0f, 1f), new Color(0.04f, 0.04f, 0.05f));
+            // ----- BuggyCockpit loads a real 3D dune-buggy model -----
+            // The procedural-primitives approach (V2) couldn't deliver the
+            // photoreal cockpit feel the project wants. Switching to a real
+            // 3D model gives us proper depth perception (cage at one depth,
+            // dash at another, windshield deeper still) for free, and decent
+            // materials without art effort.
+            //
+            // V2 (VirtualCockpitV2) is kept on disk for reference but no
+            // longer instantiated. To revert: change the line below back to
+            //   cockpitRoot.AddComponent<VirtualCockpitV2>().Build(...)
+            cockpitRoot.AddComponent<BuggyCockpit>().Build(cockpitRoot.transform, cfg, mainScreen);
+        }
 
-            // Accent strip — glowing thin line under the main screen
-            var strip = BuildMatteSlab("Accent", cockpitRoot.transform,
-                new Vector3(0, 0.35f, 1.31f), Vector3.zero,
-                new Vector3(2.6f, 0.03f, 1f), new Color(0.0f, 0.75f, 1.0f));
-            var stripRend = strip.GetComponent<MeshRenderer>();
-            stripRend.material.EnableKeyword("_EMISSION");
-            stripRend.material.SetColor("_EmissionColor", new Color(0.0f, 0.75f, 1.0f) * 2.5f);
+        /// <summary>
+        /// Build a tubular cage piece (cylinder primitive scaled and rotated to
+        /// span <paramref name="from"/> → <paramref name="to"/>). Unity's default
+        /// cylinder is 1m tall along its local Y axis with 0.5m radius, so we
+        /// scale Y to len/2 and X/Z to radius*2, then rotate Y to the segment
+        /// direction.
+        /// </summary>
+        private Transform BuildCageTube(string name, Transform parent,
+                                        Vector3 from, Vector3 to,
+                                        float radius, Color color)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            go.name = name;
+            Destroy(go.GetComponent<Collider>());
+            go.transform.SetParent(parent, false);
+            Vector3 dir = to - from;
+            float len = dir.magnitude;
+            go.transform.localPosition = (from + to) * 0.5f;
+            go.transform.localScale = new Vector3(radius * 2f, len * 0.5f, radius * 2f);
+            go.transform.localRotation = Quaternion.FromToRotation(Vector3.up, dir.normalized);
+
+            var mat = new Material(FindLitShader());
+            AssignColor(mat, color);
+            go.GetComponent<MeshRenderer>().material = mat;
+            return go.transform;
+        }
+
+        private static Shader FindLitShader()
+        {
+            // Cage tubes look better lit than unlit (hint of shading on the
+            // curved surface). Standard works in Built-in pipeline; URP/Lit
+            // is the fallback if the project ever switches back.
+            Shader s = Shader.Find("Standard")
+                    ?? Shader.Find("Universal Render Pipeline/Lit")
+                    ?? Shader.Find("Unlit/Color");
+            return s;
         }
 
         public Texture2D GetCameraTexture(int idx) => idx == 0 ? cam0Tex : cam1Tex;
@@ -206,7 +238,15 @@ namespace RcPilot.Video
             go.transform.localPosition = pos;
             go.transform.localEulerAngles = eulers;
             go.transform.localScale = scale;
-            var mat = new Material(FindUnlitShader());
+            // Use the lit shader (Standard) for slabs so colors actually
+            // apply. The unlit fallback chain after URP removal lands on
+            // Unlit/Texture, which has no _Color property — every slab would
+            // render as a plain white quad regardless of the color we set.
+            // Standard has _Color and gives subtle directional-light shading
+            // which adds depth to the matte interior surfaces. Screen quads
+            // (camera feed) keep using FindUnlitShader because they need
+            // _MainTex and explicitly do NOT want lighting on the feed.
+            var mat = new Material(FindLitShader());
             AssignColor(mat, color);
             go.GetComponent<MeshRenderer>().material = mat;
             return go.transform;

@@ -21,9 +21,11 @@ namespace RcPilot.UI
         private Text _ageText;
         private Text _lossText;
         private Text _videoText;
+        private bool _cam1Enabled;
 
         public void Build(Config cfg)
         {
+            _cam1Enabled = cfg.video.cam1Port > 0;
             UiTheme.AddPanel(gameObject, UiTheme.Bg);
 
             // Layout: state big, then 4 small rows.
@@ -64,15 +66,23 @@ namespace RcPilot.UI
             var boot = Bootstrapper.Instance;
             if (boot == null) return;
             var telem = boot.telemetry;
+            var echo = boot.echo;
             var cam0 = boot.cam0;
             var cam1 = boot.cam1;
+            bool hasTelem = telem != null && telem.HasPacket;
 
             // State
-            if (telem != null && telem.HasPacket)
+            if (hasTelem)
             {
                 var s = telem.Latest.state;
                 _stateText.text = TelemetryStates.StateName(s).ToUpper();
                 _stateBadge.color = StateColor(s);
+            }
+            else if (echo != null)
+            {
+                int health = echo.LinkHealth;
+                _stateText.text = health == 0 ? "LINK OK" : health == 1 ? "DEGRADED" : "NO LINK";
+                _stateBadge.color = health == 0 ? UiTheme.Good : health == 1 ? UiTheme.Warn : UiTheme.Bad;
             }
             else
             {
@@ -81,7 +91,7 @@ namespace RcPilot.UI
             }
 
             // RSSI
-            if (telem != null && telem.HasPacket)
+            if (hasTelem)
             {
                 int dbm = -telem.Latest.wifiRssiNeg;
                 _rssiText.text = $"WiFi: {dbm} dBm";
@@ -89,9 +99,16 @@ namespace RcPilot.UI
                                 : dbm > -70 ? UiTheme.Warn
                                 : UiTheme.Bad;
             }
+            else if (echo != null)
+            {
+                _rssiText.text = $"RTT: mean {echo.RttMeanMs:0.0} ms  p95 {echo.RttP95Ms:0.0} ms";
+                _rssiText.color = echo.LinkHealth == 0 ? UiTheme.Good
+                                : echo.LinkHealth == 1 ? UiTheme.Warn
+                                : UiTheme.Bad;
+            }
 
             // Telemetry age
-            if (telem != null)
+            if (hasTelem)
             {
                 float age = telem.AgeMs;
                 _ageText.text = $"telem: {age,4:0} ms   ({telem.SmoothedHz:0.0} Hz)";
@@ -99,9 +116,17 @@ namespace RcPilot.UI
                                : age < 80 ? UiTheme.Warn
                                : UiTheme.Bad;
             }
+            else if (echo != null)
+            {
+                float age = echo.LastEchoAgeMs;
+                _ageText.text = $"echo: {Format(age)}   sent {echo.PacketsSent}";
+                _ageText.color = echo.LinkHealth == 0 ? UiTheme.Good
+                               : echo.LinkHealth == 1 ? UiTheme.Warn
+                               : UiTheme.Bad;
+            }
 
             // Loss
-            if (telem != null && telem.HasPacket)
+            if (hasTelem)
             {
                 int loss = telem.Latest.pktLossPct;
                 _lossText.text = $"loss: {loss}%";
@@ -109,13 +134,28 @@ namespace RcPilot.UI
                                 : loss < 5 ? UiTheme.Warn
                                 : UiTheme.Bad;
             }
+            else if (echo != null)
+            {
+                uint denom = System.Math.Max(1u, echo.PacketsSent);
+                float loss = (echo.PacketsLost * 100f) / denom;
+                _lossText.text = $"echoes: {echo.EchoesReceived}  lost: {loss:0.0}%";
+                _lossText.color = loss < 1f ? UiTheme.Good
+                                : loss < 5f ? UiTheme.Warn
+                                : UiTheme.Bad;
+            }
 
             // Video
             float ageC0 = cam0 != null ? cam0.AgeMs : 9999f;
             float ageC1 = cam1 != null ? cam1.AgeMs : 9999f;
-            _videoText.text = $"video: cam0 {Format(ageC0)} | cam1 {Format(ageC1)}";
-            _videoText.color = ageC0 < 150 && ageC1 < 150 ? UiTheme.Good
-                             : ageC0 < 500 && ageC1 < 500 ? UiTheme.Warn
+            bool cam0Good = ageC0 < 150f;
+            bool cam0Ok = ageC0 < 500f;
+            bool cam1Good = !_cam1Enabled || ageC1 < 150f;
+            bool cam1Ok = !_cam1Enabled || ageC1 < 500f;
+            _videoText.text = _cam1Enabled
+                ? $"video: cam0 {Format(ageC0)} | cam1 {Format(ageC1)}"
+                : $"video: cam0 {Format(ageC0)}";
+            _videoText.color = cam0Good && cam1Good ? UiTheme.Good
+                             : cam0Ok && cam1Ok ? UiTheme.Warn
                              : UiTheme.Bad;
         }
 

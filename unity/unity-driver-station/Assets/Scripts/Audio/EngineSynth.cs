@@ -39,11 +39,17 @@ namespace RcPilot.Audio
         private float _rumblePhase;
         private System.Random _noiseRng = new System.Random(0xBEEF);
 
+        // Cached at Init time on the main thread; the audio callback runs on
+        // the audio thread where AudioSettings.outputSampleRate is illegal.
+        // 48000 is a sane default if Init runs before the audio system is up.
+        private double _sampleRate = 48000.0;
+
         public void Init(Config cfg)
         {
             _cfg = cfg;
             if (!cfg.audio.engineSoundEnabled) return;
             _volume = cfg.audio.masterVolume;
+            _sampleRate = AudioSettings.outputSampleRate;
             _src = gameObject.AddComponent<AudioSource>();
             _src.clip = AudioClip.Create("engine", 1, 1, 48000, false); // dummy, shape via OnAudioFilterRead
             _src.loop = true;
@@ -86,7 +92,7 @@ namespace RcPilot.Audio
         private void OnAudioFilterRead(float[] data, int channels)
         {
             if (_cfg == null || !_cfg.audio.engineSoundEnabled) return;
-            double sampleRate = AudioSettings.outputSampleRate;
+            double sampleRate = _sampleRate;
             double phase1Inc = _currentHz / sampleRate;
             double phase2Inc = (_currentHz * 1.01) / sampleRate;
             float rumbleHz = 30f + _currentHz * 0.1f;

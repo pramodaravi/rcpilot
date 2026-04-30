@@ -76,11 +76,15 @@ namespace RcPilot.Video
             var host = new GameObject("VirtualCockpit").transform;
             host.SetParent(cockpitRoot, false);
 
-            BuildKartBody(host);
-            BuildSteeringWheel(host);
+            // Kart body and steering wheel are now owned by VirtualCockpitV2
+            // (which models a race-buggy cockpit, not a kart). We keep this
+            // class only for the dashboard gauges (speedo, tach, status
+            // lights, lap counter) which V2 doesn't build.
+            // BuildKartBody(host);          // disabled — V2 owns body geometry
+            // BuildSteeringWheel(host);     // disabled — V2 owns the wheel
             BuildDashboardGauges(host);
 
-            Log.Info("VirtualCockpit: wheel, kart body, and dashboard built");
+            Log.Info("VirtualCockpit: dashboard gauges built (body+wheel deferred to V2)");
         }
 
         // ------------------------------------------------------------------

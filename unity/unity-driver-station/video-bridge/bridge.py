@@ -252,6 +252,9 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
 
 def main() -> int:
     p = argparse.ArgumentParser()
+    p.add_argument("--preset", choices=("fast", "balanced", "quality"), default="quality",
+                   help="quality preset: fast=640x360/q70, balanced=960x540/q80, "
+                        "quality=1280x720/q88 for a 720p input")
     p.add_argument("--in-port", type=int, default=5004,
                    help="RTP UDP port to receive on (default 5004 matches "
                         "rcpilot/config/default.yaml)")
@@ -259,13 +262,26 @@ def main() -> int:
                    help="TCP port Unity will connect to")
     p.add_argument("--bind", default="127.0.0.1",
                    help="TCP bind address (127.0.0.1 = local Unity only)")
-    p.add_argument("--quality", type=int, default=70,
-                   help="JPEG quality 1..100 (70 is a good sim/latency balance)")
-    p.add_argument("--hz", type=float, default=60.0,
+    p.add_argument("--quality", type=int, default=None,
+                   help="JPEG quality 1..100 (overrides --preset)")
+    p.add_argument("--hz", type=float, default=None,
                    help="max JPEG publish rate")
-    p.add_argument("--scale", type=float, default=0.5,
-                   help="resize factor before JPEG encode (0.5 = half)")
+    p.add_argument("--scale", type=float, default=None,
+                   help="resize factor before JPEG encode (overrides --preset)")
     args = p.parse_args()
+
+    presets = {
+        "fast": {"quality": 70, "scale": 0.50, "hz": 60.0},
+        "balanced": {"quality": 80, "scale": 0.75, "hz": 60.0},
+        "quality": {"quality": 88, "scale": 1.00, "hz": 60.0},
+    }
+    preset = presets[args.preset]
+    if args.quality is None:
+        args.quality = preset["quality"]
+    if args.scale is None:
+        args.scale = preset["scale"]
+    if args.hz is None:
+        args.hz = preset["hz"]
 
     logging.basicConfig(
         level=logging.INFO,
@@ -273,7 +289,8 @@ def main() -> int:
     )
     log = logging.getLogger("bridge")
     log.info(f"RTP in :{args.in_port}  JPEG TCP out :{args.out_port} "
-             f"quality={args.quality} scale={args.scale} hz={args.hz}")
+             f"preset={args.preset} quality={args.quality} "
+             f"scale={args.scale} hz={args.hz}")
 
     stop_evt = threading.Event()
     frame_box: dict = {}

@@ -122,7 +122,7 @@ namespace RcPilot.Core
             if (!config.sim.enabled)
             {
                 controlSender.Configure(config.network.jetsonIp, config.network.controlPort,
-                                        config.network.sendHz);
+                                        config.network.sendHz, config.network.localControlPort);
                 echo.Configure(controlSender);
             }
             else

@@ -65,12 +65,14 @@ namespace RcPilot.Network
             ? Mathf.RoundToInt((float)((Time.realtimeSinceStartupAsDouble - _lastSend) * 1000.0))
             : -1;
 
-        public void Configure(string jetsonIp, int controlPort, int sendHz)
+        public void Configure(string jetsonIp, int controlPort, int sendHz, int localPort = 0)
         {
             _sendHz = Mathf.Clamp(sendHz, 10, 500);
             try
             {
-                _udp = new UdpClient(AddressFamily.InterNetwork);
+                _udp = localPort > 0
+                    ? new UdpClient(new IPEndPoint(IPAddress.Any, localPort))
+                    : new UdpClient(AddressFamily.InterNetwork);
                 // Match rcpilot/cockpit/control_sender.py — small SNDBUF so a
                 // wifi blip doesn't queue stale control packets.
                 _udp.Client.SendBufferSize = 2048;
@@ -82,7 +84,8 @@ namespace RcPilot.Network
                 _udp.Client.ReceiveTimeout = 1;
                 _dest = new IPEndPoint(IPAddress.Parse(jetsonIp), controlPort);
                 Ready = true;
-                Log.Info($"ControlSender → {jetsonIp}:{controlPort} @ {_sendHz}Hz");
+                string local = localPort > 0 ? localPort.ToString() : "ephemeral";
+                Log.Info($"ControlSender :{local} -> {jetsonIp}:{controlPort} @ {_sendHz}Hz");
             }
             catch (Exception e)
             {

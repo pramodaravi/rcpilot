@@ -35,6 +35,7 @@ namespace RcPilot.Input
 
         private Config _cfg;
         private ControlSender _sender;
+        private int _joystickNumber = 1;
 
         // Press-edge tracking. Holding a protocol bit for EdgeHoldSec after a rising
         // edge lets the Jetson see a clean event even at 200 Hz send rate.
@@ -72,7 +73,8 @@ namespace RcPilot.Input
                 {
                     padPresent = true;
                     padName = names[i];
-                    Log.Info($"WheelInput: joystick[{i+1}] = '{padName}'");
+                    _joystickNumber = i + 1;
+                    Log.Info($"WheelInput: joystick[{_joystickNumber}] = '{padName}'");
                     break;
                 }
             }
@@ -85,9 +87,13 @@ namespace RcPilot.Input
         private float RawJoyAxis(int axisIndex)
         {
             if (!padPresent) return 0f;
-            // Unity surfaces raw axes as "joystick N axis M". Joystick 1 is the first
-            // controller seen; we don't currently multi-plex players.
-            string axisName = $"joystick 1 axis {axisIndex}";
+            // We use Unity's wildcard joystick axis names: InputManager.asset
+            // defines "joystick axis 0..9" with joyNum=0 (any joystick), so a
+            // single named axis reads from whichever physical joystick has
+            // input on that axis. Beats matching the slot number to a per-
+            // joystick axis definition (fragile on Windows when phantom
+            // slots shift the gamepad to slot 2+).
+            string axisName = $"joystick axis {axisIndex}";
             try { return UnityEngine.Input.GetAxisRaw(axisName); } catch { return 0f; }
         }
 
@@ -118,7 +124,7 @@ namespace RcPilot.Input
         private bool ReadButton(int btnIndex)
         {
             if (!padPresent || btnIndex < 0 || btnIndex > 19) return false;
-            KeyCode kc = KeyCode.Joystick1Button0 + btnIndex;
+            KeyCode kc = KeyCode.Joystick1Button0 + ((_joystickNumber - 1) * 20) + btnIndex;
             return UnityEngine.Input.GetKey(kc);
         }
 
