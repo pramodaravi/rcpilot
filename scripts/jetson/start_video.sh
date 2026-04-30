@@ -74,9 +74,14 @@ INFO
 # changes when switching encoders is this block.
 case "${ENCODER}" in
     x264enc)
+        # intra-refresh=true switches x264 from full-frame IDRs to a rolling
+        # stripe of intra-coded macroblocks moving across each frame. Means a
+        # lost RTP packet only causes localized smear that heals within a couple
+        # frames instead of taking out the whole picture for half a second. The
+        # standard answer for low-latency video over lossy networks (Wi-Fi).
         ENCODE_ELEMENT="x264enc tune=zerolatency speed-preset=${X264_PRESET} \
             bitrate=${BITRATE_KBPS} key-int-max=${KEY_INTERVAL} bframes=0 \
-            sliced-threads=true threads=4 byte-stream=true"
+            intra-refresh=true sliced-threads=true threads=4 byte-stream=true"
         # Software encode runs on system memory, so we have to come out of NVMM.
         CONVERT_ELEMENT="nvvidconv ! video/x-raw,format=I420"
         ;;
