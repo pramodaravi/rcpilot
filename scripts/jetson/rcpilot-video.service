@@ -20,8 +20,15 @@ WorkingDirectory=/home/adm2n/rcpilot
 #   Environment=RCPILOT_COCKPIT_IP=<your-wifi-cockpit-ip>
 Environment=RCPILOT_COCKPIT_IP=192.168.55.100
 ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video.sh
-Restart=on-failure
+# Use Restart=always (not on-failure) because GStreamer reports an EOS as a
+# clean exit (code 0) even when NvArgusCameraSrc failed to open. on-failure
+# would let the service stay dead in that case; always retries until the
+# camera is actually ready.
+Restart=always
 RestartSec=3
+# Cap restart spam so we don't peg the CPU if the camera is permanently dead.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 StandardOutput=journal
 StandardError=journal
 
