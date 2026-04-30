@@ -43,9 +43,18 @@ PORT="${RCPILOT_VIDEO_PORT:-5004}"
 WIDTH="${RCPILOT_VIDEO_WIDTH:-1280}"
 HEIGHT="${RCPILOT_VIDEO_HEIGHT:-720}"
 FPS="${RCPILOT_VIDEO_FPS:-60}"
-BITRATE_KBPS="${RCPILOT_BITRATE_KBPS:-8000}"
+# Bumped 8000 -> 12000 to give x264 more bits when motion hits — at the cost
+# of more bytes on the wire. Drop back to 8000 if WiFi loss climbs.
+BITRATE_KBPS="${RCPILOT_BITRATE_KBPS:-12000}"
 SENSOR_MODE="${RCPILOT_SENSOR_MODE:-4}"
 ENCODER="${RCPILOT_ENCODER:-x264enc}"
+# Half-second IDR interval (was 1 s). Doubles keyframe rate so a lost packet's
+# blocky aftermath heals within ~500 ms instead of ~1 s. Costs a few % bitrate.
+KEY_INTERVAL="${RCPILOT_KEY_INTERVAL:-$((FPS / 2))}"
+# x264 speed preset. ultrafast was the original; superfast still hits 60fps on
+# Orin Nano with 4 threads and produces noticeably better quality at the same
+# bitrate. Drop to ultrafast if CPU pegs.
+X264_PRESET="${RCPILOT_X264_PRESET:-superfast}"
 
 cat <<INFO >&2
 ====================================================
@@ -65,8 +74,8 @@ INFO
 # changes when switching encoders is this block.
 case "${ENCODER}" in
     x264enc)
-        ENCODE_ELEMENT="x264enc tune=zerolatency speed-preset=ultrafast \
-            bitrate=${BITRATE_KBPS} key-int-max=${FPS} bframes=0 \
+        ENCODE_ELEMENT="x264enc tune=zerolatency speed-preset=${X264_PRESET} \
+            bitrate=${BITRATE_KBPS} key-int-max=${KEY_INTERVAL} bframes=0 \
             sliced-threads=true threads=4 byte-stream=true"
         # Software encode runs on system memory, so we have to come out of NVMM.
         CONVERT_ELEMENT="nvvidconv ! video/x-raw,format=I420"
