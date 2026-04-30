@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "rcpilot",
+    "description": {
+        "": {
+            "name": "rcpilot_carrier_tray_v1",
+            "description": "On-vehicle carrier tray that holds the Jetson Orin Nano Super Case (used as-is) plus a 3S 2200 mAh shorty pack, expansion module, and 2x IMX219 cameras. Bolts to the RC chassis via 4 M3 floor holes."
+        }
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}

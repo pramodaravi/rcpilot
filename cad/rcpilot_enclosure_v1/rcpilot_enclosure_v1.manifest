@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "rcpilot",
+    "description": {
+        "": {
+            "name": "rcpilot_enclosure_v1",
+            "description": "On-vehicle enclosure that houses the Jetson Orin Nano, 3S 2200 mAh shorty pack, expansion module, and 2x IMX219 cameras. Parametric — edit the constants at the top of the .py file and re-run."
+        }
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
