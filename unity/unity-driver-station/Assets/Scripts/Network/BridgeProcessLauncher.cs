@@ -35,11 +35,25 @@ namespace RcPilot.Network
     {
         [Header("Process control")]
         public bool autoStart = true;
-        [Tooltip("video-bridge --preset value: fast / balanced / quality")]
-        public string preset = "quality";
+        [Tooltip("video-bridge --preset value: lowlatency / fast / balanced / quality")]
+        public string preset = "lowlatency";
         [Tooltip("Show the bridge in its own console window. Default false: " +
                  "the bridge's stdout streams into Unity's Console instead.")]
         public bool showWindow = false;
+
+        [Header("Bridge network")]
+        [Tooltip("RTP/H.264 UDP port from the Jetson camera sender.")]
+        public int inPort = 5004;
+        [Tooltip("JPEG-over-TCP port Unity connects to on localhost.")]
+        public int outPort = 9000;
+        [Tooltip("TCP bind address for Unity's bridge connection.")]
+        public string tcpBind = "127.0.0.1";
+        [Tooltip("RTP UDP bind address. 'auto' uses the local route to jetsonIp.")]
+        public string rtpBind = "auto";
+        [Tooltip("Jetson address used to auto-detect the local RTP bind address.")]
+        public string jetsonIp = "192.168.55.1";
+        [Tooltip("Bridge payload format: raw is lowest latency on localhost; jpeg is fallback.")]
+        public string frameFormat = "raw";
 
         [Header("Python launcher (Windows defaults)")]
         [Tooltip("Windows Python launcher executable. 'py' picks up the right " +
@@ -74,7 +88,10 @@ namespace RcPilot.Network
                 return;
             }
 
-            string args = $"{pythonVersionArg} \"{scriptPath}\" --preset {preset}";
+            string args = $"{pythonVersionArg} \"{scriptPath}\" --preset {preset} " +
+                          $"--in-port {inPort} --out-port {outPort} --bind {tcpBind} " +
+                          $"--rtp-bind {rtpBind} --jetson-ip {jetsonIp} " +
+                          $"--frame-format {frameFormat}";
             try
             {
                 var psi = new ProcessStartInfo
@@ -119,7 +136,7 @@ namespace RcPilot.Network
             catch (Exception e)
             {
                 Log.Err($"BridgeProcessLauncher: failed to start bridge: {e.Message}. " +
-                        "Make sure '{pythonExe}' is on PATH and Python 3.11 is installed.");
+                        $"Make sure '{pythonExe}' is on PATH and Python 3.11 is installed.");
                 _process = null;
             }
         }

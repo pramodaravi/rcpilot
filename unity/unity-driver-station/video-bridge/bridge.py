@@ -1,4 +1,4 @@
-"""RTP H.264 → JPEG TCP bridge for the Unity driver station.
+"""RTP H.264 → raw RGB (default) or JPEG TCP bridge for the Unity driver station.
 
 V1 is single-camera: the Jetson sends RTP H.264 to UDP 5004 (matches
 rcpilot/config/default.yaml on the Jetson). Unity's built-in H.264 decoding
@@ -6,12 +6,12 @@ is flaky for live low-latency RTP, so this sidecar:
 
     1. receives the RTP stream via PyAV (FFmpeg under the hood)
     2. drops old frames to keep latency bounded (~1 frame buffer)
-    3. re-encodes each frame as a small JPEG
-    4. serves JPEG frames over TCP to Unity, with 8-byte framing:
+    3. serves raw RGB frames over TCP to Unity by default, or JPEG when asked,
+       with small binary frame headers:
 
-         4 bytes "JFRM"
-         4 bytes little-endian uint  (jpeg byte length)
-         N bytes                      (jpeg data)
+         JPEG: 4 bytes "JFRM" + 4 bytes little-endian uint + JPEG bytes
+         Raw : 4 bytes "RFRM" + 4 bytes little-endian uint + u16 width
+               + u16 height + RGB24 bytes
 
 Run:
 
@@ -32,7 +32,9 @@ opencv-contrib-python wheel. On macOS (especially Apple Silicon) that stack is
 brittle: Homebrew's gstreamer doesn't auto-wire up to Python's opencv wheel,
 and the contrib wheel isn't always built with GStreamer anyway. PyAV wraps
 FFmpeg directly with prebuilt wheels for every Mac arch — one `pip install av`
-and you're done. The wire format to Unity is byte-for-byte unchanged.
+and you're done. The JPEG wire format from the OpenCV days is preserved as a
+fallback (--frame-format jpeg); raw RGB (RFRM) is the new default for lower
+localhost latency.
 
 ## Latency budget
 
@@ -59,7 +61,8 @@ import av
 from PIL import Image  # PIL reads numpy arrays directly; numpy comes via PyAV
 
 
-MAGIC = b"JFRM"
+MAGIC_JPEG = b"JFRM"
+MAGIC_RAW = b"RFRM"
 
 # Minimal SDP describing the Jetson's H.264 RTP stream. Matches the caps that
 # gst-launch's rtph264pay pt=96 produces on the sender side — same params the
@@ -84,13 +87,42 @@ def write_sdp(in_port: int) -> str:
     """
     sdp = SDP_TEMPLATE.format(port=in_port)
     fd, path = tempfile.mkstemp(prefix=f"rc-pilot-{in_port}-", suffix=".sdp")
-    with os.fdopen(fd, "w") as f:
-        f.write(sdp)
+    with os.fdopen(fd, "wb") as f:
+        f.write(sdp.encode("ascii"))
     return path
 
 
+def resolve_rtp_bind(requested_bind: str, jetson_ip: str, in_port: int,
+                     log: logging.Logger) -> str:
+    """Choose the local interface FFmpeg should bind for incoming RTP."""
+    requested = (requested_bind or "auto").strip()
+    if requested.lower() != "auto":
+        return requested
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((jetson_ip, in_port))
+            local_ip = probe.getsockname()[0]
+    except OSError as e:
+        log.warning(
+            f"could not auto-detect RTP bind address for Jetson {jetson_ip}: "
+            f"{e}; falling back to 0.0.0.0"
+        )
+        return "0.0.0.0"
+
+    if not local_ip or local_ip.startswith("127."):
+        log.warning(
+            f"auto-detected RTP bind address was {local_ip or '<none>'}; "
+            "falling back to 0.0.0.0"
+        )
+        return "0.0.0.0"
+
+    return local_ip
+
+
 def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
-                 scale: float) -> None:
+                 scale: float, rtp_bind: str, reorder_queue: int,
+                 udp_buffer: int) -> None:
     """Background thread: pull frames from the RTP stream via PyAV.
 
     Keeps only the latest decoded frame in frame_box. Scales during decode
@@ -101,37 +133,54 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
     sdp_path = write_sdp(in_port)
     last_log = time.monotonic()
     last_count = 0
+    decode_errors = 0
 
     # Reopen on failure — the Jetson may not be streaming yet.
     while not stop_evt.is_set():
+        open_options = {
+            # Let FFmpeg open udp:// URLs referenced by the sdp.
+            "protocol_whitelist": "file,udp,rtp",
+            # Small reorder queue soaks up a stray out-of-order RTP
+            # packet without adding meaningful latency.
+            "reorder_queue_size": str(max(0, reorder_queue)),
+            # 0.5 s socket timeout so we notice a stream stall quickly.
+            "stimeout": "500000",
+            # Keep the UDP and demux buffers small. If the app falls behind,
+            # dropping old packets is better than faithfully playing stale video.
+            "buffer_size": str(max(8192, udp_buffer)),
+            "rtbufsize": str(max(8192, udp_buffer)),
+            "overrun_nonfatal": "1",
+            "probesize": "32",
+            "analyzeduration": "0",
+            # Low-latency flags: no buffering past what's needed to decode.
+            "fflags": "nobuffer",
+            "flags": "low_delay",
+            "max_delay": "0",
+        }
+        if rtp_bind and rtp_bind not in ("0.0.0.0", "::"):
+            open_options["localaddr"] = rtp_bind
+
         try:
             container = av.open(
                 sdp_path,
                 format="sdp",
-                options={
-                    # Let FFmpeg open udp:// URLs referenced by the sdp.
-                    "protocol_whitelist": "file,udp,rtp",
-                    # Small reorder queue soaks up a stray out-of-order RTP
-                    # packet without adding meaningful latency.
-                    "reorder_queue_size": "50",
-                    # 0.5 s socket timeout so we notice a stream stall quickly.
-                    "stimeout": "500000",
-                    # Low-latency flags: no buffering past what's needed to decode.
-                    "fflags": "nobuffer",
-                    "flags": "low_delay",
-                    "max_delay": "0",
-                },
+                options=open_options,
             )
         except av.FFmpegError as e:
             log.warning(f"av.open failed ({e}), retrying in 2 s")
             time.sleep(2)
             continue
 
-        log.info("RTP stream open, decoding frames")
+        log.info(f"RTP stream open on {rtp_bind}:{in_port}, decoding frames")
         try:
             stream = container.streams.video[0]
-            # Threaded decode: worth it on Apple Silicon even for 720p.
-            stream.thread_type = "AUTO"
+            # Frame threading can add decode latency. Slice threading keeps
+            # parallelism where the codec supports it without queueing whole
+            # frames behind the scenes.
+            try:
+                stream.thread_type = "SLICE"
+            except ValueError:
+                stream.thread_type = "NONE"
 
             # Precompute target size once we see the first frame (or from stream metadata).
             target_w = target_h = None
@@ -158,10 +207,22 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
 
                         frame_box["latest"] = rgb
                         frame_box["count"] = frame_box.get("count", 0) + 1
+                        frame_box["updated_at"] = time.monotonic()
                 except Exception as e:
                     # Single packet failed to decode — log and continue.
-                    log.warning(f"decode error: {type(e).__name__}: {e}")
+                    decode_errors += 1
+                    log.debug(f"decode error: {type(e).__name__}: {e}")
                     log.debug(traceback.format_exc())
+                    now = time.monotonic()
+                    if now - last_log >= 1.0:
+                        delta = frame_box.get("count", 0) - last_count
+                        last_count = frame_box.get("count", 0)
+                        last_log = now
+                        log.info(
+                            f"decode: {delta} fps  total={last_count} "
+                            f"errors={decode_errors}"
+                        )
+                        decode_errors = 0
                     continue
 
                 # Per-second decode-rate heartbeat so we can SEE frames flowing.
@@ -170,9 +231,11 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
                     delta = frame_box.get("count", 0) - last_count
                     last_count = frame_box.get("count", 0)
                     last_log = now
+                    suffix = f" errors={decode_errors}" if decode_errors else ""
                     log.info(
-                        f"decode: {delta} fps  total={last_count}"
+                        f"decode: {delta} fps  total={last_count}{suffix}"
                     )
+                    decode_errors = 0
         except Exception as e:
             log.warning(
                 f"demux error: {type(e).__name__}: {e} — reconnecting"
@@ -187,7 +250,8 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
 
 
 def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
-                     target_hz: float, log: logging.Logger) -> None:
+                     target_hz: float, frame_format: str,
+                     log: logging.Logger) -> None:
     """Per-client thread: JPEG-encode and send frames at target_hz.
 
     Encoding is done with Pillow — C-implemented libjpeg, ~1-2 ms per frame
@@ -199,7 +263,8 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
     sent_in_window = 0
     last_log = time.monotonic()
 
-    conn.settimeout(0.5)
+    conn.settimeout(0.08)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
     try:
         while True:
             now = time.monotonic()
@@ -225,17 +290,29 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
                 continue
             last_count = count
 
-            # frame is HxWx3 RGB uint8 (from reformat above).
-            img = Image.fromarray(frame, mode="RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality, optimize=False)
-            data = buf.getvalue()
-
-            header = MAGIC + struct.pack("<I", len(data))
             try:
-                conn.sendall(header + data)
+                if frame_format == "raw":
+                    h, w = frame.shape[:2]
+                    size = int(frame.nbytes)
+                    header = MAGIC_RAW + struct.pack("<IHH", size, w, h)
+                    conn.sendall(header)
+                    conn.sendall(memoryview(frame).cast("B"))
+                else:
+                    # frame is HxWx3 RGB uint8 (from reformat above).
+                    img = Image.fromarray(frame, mode="RGB")
+                    buf = io.BytesIO()
+                    img.save(
+                        buf,
+                        format="JPEG",
+                        quality=quality,
+                        optimize=False,
+                        subsampling=2,
+                    )
+                    data = buf.getvalue()
+                    header = MAGIC_JPEG + struct.pack("<I", len(data))
+                    conn.sendall(header + data)
                 sent_in_window += 1
-            except (BrokenPipeError, ConnectionResetError, socket.timeout) as e:
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, socket.timeout) as e:
                 log.info(f"client disconnected: {e}")
                 return
             except Exception as e:
@@ -252,9 +329,10 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--preset", choices=("fast", "balanced", "quality"), default="quality",
-                   help="quality preset: fast=640x360/q70, balanced=960x540/q80, "
-                        "quality=1280x720/q88 for a 720p input")
+    p.add_argument("--preset", choices=("lowlatency", "fast", "balanced", "quality"),
+                   default="lowlatency",
+                   help="quality preset: lowlatency/fast=640x360, "
+                        "balanced=960x540, quality=1280x720 for a 720p input")
     p.add_argument("--in-port", type=int, default=5004,
                    help="RTP UDP port to receive on (default 5004 matches "
                         "rcpilot/config/default.yaml)")
@@ -262,6 +340,19 @@ def main() -> int:
                    help="TCP port Unity will connect to")
     p.add_argument("--bind", default="127.0.0.1",
                    help="TCP bind address (127.0.0.1 = local Unity only)")
+    p.add_argument("--rtp-bind", default="auto",
+                   help="local address for incoming RTP UDP. auto binds to "
+                        "the interface used to reach --jetson-ip; 0.0.0.0 "
+                        "listens on all interfaces")
+    p.add_argument("--jetson-ip", default=os.getenv("RCPILOT_JETSON_IP", "192.168.55.1"),
+                   help="Jetson address used only for --rtp-bind auto routing")
+    p.add_argument("--frame-format", choices=("raw", "jpeg"), default="raw",
+                   help="Unity bridge payload format. raw is lowest latency on localhost; "
+                        "jpeg is a compatibility fallback")
+    p.add_argument("--reorder-queue", type=int, default=0,
+                   help="FFmpeg RTP reorder queue size. 0 favors latency over packet repair")
+    p.add_argument("--udp-buffer", type=int, default=65536,
+                   help="RTP UDP receive buffer in bytes")
     p.add_argument("--quality", type=int, default=None,
                    help="JPEG quality 1..100 (overrides --preset)")
     p.add_argument("--hz", type=float, default=None,
@@ -271,8 +362,9 @@ def main() -> int:
     args = p.parse_args()
 
     presets = {
+        "lowlatency": {"quality": 65, "scale": 0.50, "hz": 60.0},
         "fast": {"quality": 70, "scale": 0.50, "hz": 60.0},
-        "balanced": {"quality": 80, "scale": 0.75, "hz": 60.0},
+        "balanced": {"quality": 76, "scale": 0.75, "hz": 45.0},
         "quality": {"quality": 88, "scale": 1.00, "hz": 60.0},
     }
     preset = presets[args.preset]
@@ -288,15 +380,18 @@ def main() -> int:
         format="%(asctime)s %(name)-12s %(levelname)s: %(message)s",
     )
     log = logging.getLogger("bridge")
-    log.info(f"RTP in :{args.in_port}  JPEG TCP out :{args.out_port} "
+    rtp_bind = resolve_rtp_bind(args.rtp_bind, args.jetson_ip, args.in_port, log)
+    log.info(f"RTP in {rtp_bind}:{args.in_port}  {args.frame_format} TCP out {args.bind}:{args.out_port} "
              f"preset={args.preset} quality={args.quality} "
-             f"scale={args.scale} hz={args.hz}")
+             f"scale={args.scale} hz={args.hz} format={args.frame_format}")
 
     stop_evt = threading.Event()
     frame_box: dict = {}
 
     reader = threading.Thread(
-        target=frame_reader, args=(args.in_port, stop_evt, frame_box, args.scale),
+        target=frame_reader,
+        args=(args.in_port, stop_evt, frame_box, args.scale, rtp_bind,
+              args.reorder_queue, args.udp_buffer),
         daemon=True,
     )
     reader.start()
@@ -314,7 +409,7 @@ def main() -> int:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             t = threading.Thread(
                 target=serve_one_client,
-                args=(conn, frame_box, args.quality, args.hz,
+                args=(conn, frame_box, args.quality, args.hz, args.frame_format,
                       logging.getLogger(f"tx:{args.out_port}")),
                 daemon=True,
             )

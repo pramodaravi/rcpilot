@@ -154,6 +154,7 @@ MonoBehaviour:
   config:
     network:
       jetsonIp: 192.168.55.1
+      localControlPort: 5005
       controlPort: 5005
       telemetryPort: 5006
       sendHz: 250

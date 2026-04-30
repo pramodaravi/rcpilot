@@ -132,6 +132,8 @@ namespace RcPilot.Core
                 // BridgeProcessLauncher.autoStart=false in the Inspector if
                 // you want to launch the bridge manually for debugging.
                 var bridgeLauncher = gameObject.AddComponent<BridgeProcessLauncher>();
+                bridgeLauncher.jetsonIp = config.network.jetsonIp;
+                bridgeLauncher.outPort = config.video.cam0Port;
                 if (bridgeLauncher.autoStart) bridgeLauncher.Launch();
             }
             else
