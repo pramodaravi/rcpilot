@@ -43,16 +43,24 @@ namespace RcPilot.UI
             var scaler = canvasGO.AddComponent<CanvasScaler>();
             scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
             scaler.referenceResolution = new Vector2(1920, 1080);
-            scaler.matchWidthOrHeight = 0.5f;
+            // Match by HEIGHT (1.0) so the HUD always fits vertically regardless
+            // of aspect ratio. Corner-anchored elements stay anchored on wider
+            // screens; on narrower (uncommon) the UI scales down. The earlier
+            // 0.5 blend caused vertical overflow on shorter-than-1080 viewports
+            // (e.g. Game view in Free Aspect at 1.5x scale).
+            scaler.matchWidthOrHeight = 1.0f;
             canvasGO.AddComponent<GraphicRaycaster>();
 
-            // Status panel — top-left
+            // Status panel — top-left.
+            // Height 200 (was 180): the StatusPanel's bottom Video row sits at
+            // topOffset 156 + 28 = 184 internally, so 180 was clipping its last
+            // row by 4px. 200 gives 16px of buffer below the last row.
             var statusGO = new GameObject("StatusPanel", typeof(RectTransform));
             statusGO.transform.SetParent(canvas.transform, false);
             statusPanel = statusGO.AddComponent<StatusPanel>();
             statusPanel.Build(cfg);
             Anchor(statusGO.GetComponent<RectTransform>(), new Vector2(0, 1),
-                   new Vector2(40, -40), new Vector2(480, 180));
+                   new Vector2(40, -40), new Vector2(480, 200));
 
             // Lap timer — top-right
             var lapGO = new GameObject("LapTimer", typeof(RectTransform));
