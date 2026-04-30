@@ -47,7 +47,7 @@ namespace RcPilot.Race
             _lapStart = Time.unscaledTime;
         }
 
-        public void Sample(WheelState ws, TelemetryReceiver telem)
+        public void Record(WheelState ws, TelemetryReceiver telem)
         {
             if (_lapStart < 0) _lapStart = Time.unscaledTime;
             if (currentLap.Count >= 60000) return; // 10 min cap at 100 Hz

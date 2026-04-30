@@ -25,7 +25,7 @@
     "btnReset": 3,
     "btnToggleCam": 4,
     "btnLapMark": 5,
-    "logDiscovery": false
+    "logDiscovery": true
   },
   "race": {
     "targetLapCount": 5,

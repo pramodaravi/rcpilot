@@ -96,8 +96,11 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
     Keeps only the latest decoded frame in frame_box. Scales during decode
     reformat (swscale) rather than in numpy — much cheaper per frame.
     """
+    import traceback
     log = logging.getLogger(f"rx:{in_port}")
     sdp_path = write_sdp(in_port)
+    last_log = time.monotonic()
+    last_count = 0
 
     # Reopen on failure — the Jetson may not be streaming yet.
     while not stop_evt.is_set():
@@ -119,7 +122,7 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
                     "max_delay": "0",
                 },
             )
-        except av.AVError as e:
+        except av.FFmpegError as e:
             log.warning(f"av.open failed ({e}), retrying in 2 s")
             time.sleep(2)
             continue
@@ -155,12 +158,26 @@ def frame_reader(in_port: int, stop_evt: threading.Event, frame_box: dict,
 
                         frame_box["latest"] = rgb
                         frame_box["count"] = frame_box.get("count", 0) + 1
-                except av.AVError as e:
-                    # Single packet failed to decode — ignore, continue.
-                    log.debug(f"decode error (skipped): {e}")
+                except Exception as e:
+                    # Single packet failed to decode — log and continue.
+                    log.warning(f"decode error: {type(e).__name__}: {e}")
+                    log.debug(traceback.format_exc())
                     continue
-        except av.AVError as e:
-            log.warning(f"demux error: {e} — reconnecting")
+
+                # Per-second decode-rate heartbeat so we can SEE frames flowing.
+                now = time.monotonic()
+                if now - last_log >= 1.0:
+                    delta = frame_box.get("count", 0) - last_count
+                    last_count = frame_box.get("count", 0)
+                    last_log = now
+                    log.info(
+                        f"decode: {delta} fps  total={last_count}"
+                    )
+        except Exception as e:
+            log.warning(
+                f"demux error: {type(e).__name__}: {e} — reconnecting"
+            )
+            log.debug(traceback.format_exc())
         finally:
             try:
                 container.close()
@@ -179,6 +196,8 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
     period = 1.0 / max(1.0, target_hz)
     next_send = time.monotonic()
     last_count = -1
+    sent_in_window = 0
+    last_log = time.monotonic()
 
     conn.settimeout(0.5)
     try:
@@ -188,6 +207,15 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
             if sleep_for > 0:
                 time.sleep(sleep_for)
             next_send += period
+
+            # Per-second send-rate heartbeat (independent of whether we send).
+            if now - last_log >= 1.0:
+                count_now = frame_box.get("count", 0)
+                log.info(
+                    f"send: {sent_in_window} fps  framebox_count={count_now}"
+                )
+                sent_in_window = 0
+                last_log = now
 
             frame = frame_box.get("latest")
             count = frame_box.get("count", 0)
@@ -206,8 +234,14 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
             header = MAGIC + struct.pack("<I", len(data))
             try:
                 conn.sendall(header + data)
+                sent_in_window += 1
             except (BrokenPipeError, ConnectionResetError, socket.timeout) as e:
                 log.info(f"client disconnected: {e}")
+                return
+            except Exception as e:
+                log.warning(
+                    f"send error: {type(e).__name__}: {e}"
+                )
                 return
     finally:
         try:

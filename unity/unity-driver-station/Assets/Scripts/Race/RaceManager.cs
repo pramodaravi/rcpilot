@@ -167,7 +167,7 @@ namespace RcPilot.Race
 
                 case Phase.OnLap:
                     CurrentLapTime = t - _lapStartTime;
-                    ghost.Sample(_wheel?.state ?? default, _telem);
+                    ghost.Record(_wheel?.state ?? default, _telem);
                     break;
             }
         }

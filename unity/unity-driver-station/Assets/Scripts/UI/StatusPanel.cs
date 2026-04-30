@@ -71,7 +71,7 @@ namespace RcPilot.UI
             if (telem != null && telem.HasPacket)
             {
                 var s = telem.Latest.state;
-                _stateText.text = Protocol.StateName(s).ToUpper();
+                _stateText.text = TelemetryStates.StateName(s).ToUpper();
                 _stateBadge.color = StateColor(s);
             }
             else

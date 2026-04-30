@@ -1,7 +1,12 @@
 # PyAV wraps FFmpeg; prebuilt wheels for macOS (both arm64 and x86_64), Linux,
 # and Windows. No external GStreamer install needed. 11.x bundles recent
 # FFmpeg 6.x, plenty for H.264 RTP decode.
-av>=11.0,<15.0
+#
+# Upper bound is <14.4 because PyAV 14.4.0 dropped Windows cp311 wheels —
+# pip would fall back to source build, which needs FFmpeg dev headers we
+# don't ship. 14.2.0 has cp311+win64 wheels and works fine. Bump the upper
+# bound only after verifying wheels exist for your target Python versions.
+av>=11.0,<14.4
 
 # Pillow for JPEG encode — libjpeg under the hood, prebuilt Apple Silicon wheels.
 Pillow>=10.0

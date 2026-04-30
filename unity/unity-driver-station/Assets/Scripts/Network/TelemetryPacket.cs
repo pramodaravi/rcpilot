@@ -56,5 +56,16 @@ namespace RcPilot.Network
         public const byte STATE_ESTOP    = 3;
         public const byte STATE_FAULT    = 4;
         public const byte STATE_DISARMED = STATE_IDLE; // alias retained from v0.1
+
+        /// <summary>Human-readable name for a state byte. Replaces v0.1's Protocol.StateName.</summary>
+        public static string StateName(byte state) => state switch
+        {
+            STATE_IDLE    => "idle",
+            STATE_ARMED   => "armed",
+            STATE_RUNNING => "running",
+            STATE_ESTOP   => "estop",
+            STATE_FAULT   => "fault",
+            _             => "unknown",
+        };
     }
 }
