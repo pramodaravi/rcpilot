@@ -1,0 +1,29 @@
+[Unit]
+Description=rcpilot video sender (IMX219 -> RTP H.264 -> cockpit)
+Documentation=https://github.com/pramodaravi/rcpilot
+After=network-online.target
+Wants=network-online.target
+# Wait for the v4l2 device tree entry to settle before the GStreamer pipeline
+# tries to open it. Without this, on cold boot start_video.sh sometimes races
+# the camera initialization and fails with 'Could not open device /dev/video0'.
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=adm2n
+Group=adm2n
+WorkingDirectory=/home/adm2n/rcpilot
+# Cockpit IP for USB-C virtual ethernet bench bring-up. Override with
+# 'sudo systemctl edit rcpilot-video.service' to switch to a Wi-Fi IP for
+# over-the-air operation; create a drop-in with:
+#   [Service]
+#   Environment=RCPILOT_COCKPIT_IP=<your-wifi-cockpit-ip>
+Environment=RCPILOT_COCKPIT_IP=192.168.55.100
+ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video.sh
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

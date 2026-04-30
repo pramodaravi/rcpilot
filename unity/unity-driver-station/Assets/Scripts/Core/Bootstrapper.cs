@@ -124,6 +124,15 @@ namespace RcPilot.Core
                 controlSender.Configure(config.network.jetsonIp, config.network.controlPort,
                                         config.network.sendHz, config.network.localControlPort);
                 echo.Configure(controlSender);
+
+                // Auto-spawn the local Python video-bridge sidecar so the user
+                // doesn't have to open a PowerShell window every session.
+                // Lifetime is tied to this GameObject; OnDestroy / OnQuit on
+                // the launcher kills the bridge cleanly. Disable via
+                // BridgeProcessLauncher.autoStart=false in the Inspector if
+                // you want to launch the bridge manually for debugging.
+                var bridgeLauncher = gameObject.AddComponent<BridgeProcessLauncher>();
+                if (bridgeLauncher.autoStart) bridgeLauncher.Launch();
             }
             else
             {

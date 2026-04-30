@@ -1,0 +1,20 @@
+[Unit]
+Description=rcpilot echo server (UDP control packet RTT echo)
+Documentation=https://github.com/pramodaravi/rcpilot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adm2n
+Group=adm2n
+WorkingDirectory=/home/adm2n/rcpilot
+# Uses the venv created by scripts/jetson/install.sh.
+ExecStart=/opt/rcpilot/venv/bin/rcpilot-echo-server -v
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

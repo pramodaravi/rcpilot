@@ -26,6 +26,14 @@ namespace RcPilot.Video
         public bool modelLoaded;
 
         private Transform _steeringWheelRoot;
+        // Saved at build time so steering rotation is applied ON TOP of the
+        // wheel's authored tilt (e.g. -66° X from Blender) rather than
+        // overwriting it. localRotation = _wheelBase * Quaternion(0,0,-steer*lock)
+        // spins the rim around its own face-normal axis without flattening.
+        private Quaternion _wheelBaseRotation = Quaternion.identity;
+        // Max wheel-lock angle in degrees at full steering. Real karts use
+        // 270°; tweak per-car as needed.
+        public float wheelLockDeg = 270f;
 
         public void Build(Transform root, Config cfg, Transform windshieldQuad)
         {
@@ -61,7 +69,36 @@ namespace RcPilot.Video
                 windshieldQuad.localEulerAngles = Vector3.zero;
             }
 
+            // Find the steering wheel transform inside the imported model so
+            // Update() can rotate it with the driver's steering input. The
+            // Blender script names this object "SteeringWheel" (the parent
+            // empty containing rim + boss + spokes + display). FBX export
+            // preserves the name on the corresponding GameObject.
+            _steeringWheelRoot = FindChildByName(buggyInstance.transform, "SteeringWheel");
+            if (_steeringWheelRoot == null)
+            {
+                Log.Warn("BuggyCockpit: 'SteeringWheel' not found in imported FBX — wheel won't animate. " +
+                         "Check the model contains an object named exactly 'SteeringWheel'.");
+            }
+            else
+            {
+                _wheelBaseRotation = _steeringWheelRoot.localRotation;
+            }
+
             Log.Info("BuggyCockpit: loaded Resources/Buggy/buggy");
+        }
+
+        /// <summary>Recursively search a transform hierarchy for a child with
+        /// the given name. Case-sensitive, returns the first match.</summary>
+        private static Transform FindChildByName(Transform parent, string name)
+        {
+            if (parent.name == name) return parent;
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                var found = FindChildByName(parent.GetChild(i), name);
+                if (found != null) return found;
+            }
+            return null;
         }
 
         private void BuildProcedural(Transform root, Transform windshieldQuad)
@@ -130,8 +167,12 @@ namespace RcPilot.Video
             if (_steeringWheelRoot != null && boot != null && boot.wheelInput != null)
             {
                 float steer = Mathf.Clamp(boot.wheelInput.state.steering, -1f, 1f);
+                // Multiply: spin around local Z first (the wheel's face normal),
+                // then apply the wheel's authored tilt. For the procedural build
+                // _wheelBaseRotation is identity so the old (-66 X tilt baked
+                // into the rotation) behavior changes — handled below.
                 _steeringWheelRoot.localRotation =
-                    Quaternion.Euler(-66f, 0f, -steer * 270f);
+                    _wheelBaseRotation * Quaternion.Euler(0f, 0f, -steer * wheelLockDeg);
             }
         }
 
@@ -141,6 +182,9 @@ namespace RcPilot.Video
             _steeringWheelRoot.SetParent(root, false);
             _steeringWheelRoot.localPosition = new Vector3(0f, 0.72f, 0.18f);
             _steeringWheelRoot.localEulerAngles = new Vector3(-66f, 0f, 0f);
+            // Capture the authored tilt as the base so Update() can multiply
+            // a steering rotation onto it without flattening this -66° rake.
+            _wheelBaseRotation = _steeringWheelRoot.localRotation;
 
             const int segments = 18;
             const float radius = 0.22f;
