@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "script",
+    "author": "rcpilot",
+    "description": {
+        "": {
+            "name": "rcpilot_battery_box_v1",
+            "description": "Standalone print-ready battery enclosure for the 3S 2200 mAh shorty pack. Bolts to the NVIDIA Orin Nano Base_Plate (or chassis) via 2x M3 flange holes. Removable lid with 4 corner bosses, cable pass-through, 2 strap slots."
+        }
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
