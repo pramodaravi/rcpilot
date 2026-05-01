@@ -376,6 +376,120 @@ def buildFloorChannel(comp):
     )
 
 
+def filletOuterCorners(comp, radius_mm):
+    """Find every vertical edge whose XY position sits at one of the four outer
+    corners of the tray (X in {0, OUTER_L} AND Y in {0, OUTER_W}) and apply a
+    constant-radius fillet. Done programmatically because picking the right
+    edges by hand in Fusion's UI is tedious and error-prone."""
+    tol = 0.001  # cm
+    target_xs = (0.0, cm(OUTER_L))
+    target_ys = (0.0, cm(OUTER_W))
+
+    edges_coll = adsk.core.ObjectCollection.create()
+    for body in comp.bRepBodies:
+        for edge in body.edges:
+            geom = edge.geometry
+            if geom.objectType != adsk.core.Line3D.classType():
+                continue
+            sp, ep = geom.startPoint, geom.endPoint
+            # Vertical only: X and Y constant, Z varies
+            if abs(sp.x - ep.x) > tol or abs(sp.y - ep.y) > tol:
+                continue
+            if abs(sp.z - ep.z) < tol:
+                continue
+            # Snap-test against outer corner XY
+            if not any(abs(sp.x - tx) < tol for tx in target_xs):
+                continue
+            if not any(abs(sp.y - ty) < tol for ty in target_ys):
+                continue
+            edges_coll.add(edge)
+
+    if edges_coll.count == 0:
+        return 0
+    fillets = comp.features.filletFeatures
+    inp = fillets.createInput()
+    inp.addConstantRadiusEdgeSet(
+        edges_coll,
+        adsk.core.ValueInput.createByReal(cm(radius_mm)),
+        True,
+    )
+    fillets.add(inp)
+    return edges_coll.count
+
+
+def importSuperCase(app, design, comp):
+    """Import the Super Case STEP and lay it flat in the cradle bay.
+
+    The native STEP bbox is 70 (X) x 115.5 (Y) x 119 (Z). To lay it on its
+    side so the 119 dim becomes our X (back-to-front), we rotate -90 deg
+    about the Y axis. That maps native (X, Y, Z) -> (Z, Y, -X), giving
+    a footprint of 119 x 115.5 with height 70.
+    """
+    step_path = (
+        r"C:\Users\Promo\dev\rcpilot\cad\Jetson-Orin-Nano-Super-Case"
+        r"\V2.0\Case_V2.0_wpins.step"
+    )
+    import os
+    if not os.path.exists(step_path):
+        return None  # silently skip if user hasn't cloned the repo
+
+    imp_mgr = app.importManager
+    opts = imp_mgr.createSTEPImportOptions(step_path)
+    opts.isViewFit = False
+    # Import as a new component into the active design's root.
+    case_occs = imp_mgr.importToTarget2(opts, design.rootComponent)
+    if not case_occs or case_occs.count == 0:
+        return None
+    case_occ = case_occs.item(0)
+
+    # Native STEP CARTESIAN_POINT bbox (parsed from the file):
+    NATIVE_MIN = (-29.9, -26.5, -10.5)
+    NATIVE_MAX = ( 40.1,  89.0, 108.5)
+
+    # Step 1: rotation -90 deg about Y axis at origin.
+    # Maps native (x,y,z) -> world (-z, y, x), so the native bbox becomes
+    #   world X = -native Z = [-108.5 .. 10.5]
+    #   world Y = native Y = [-26.5 .. 89]
+    #   world Z = native X = [-29.9 .. 40.1]
+    # i.e. the case lies on its side: 119 deep (X) x 115.5 wide (Y) x 70 tall (Z).
+    rot = adsk.core.Matrix3D.create()
+    axis = adsk.core.Vector3D.create(0, 1, 0)
+    origin = adsk.core.Point3D.create(0, 0, 0)
+    rot.setToRotation(-math.pi / 2.0, axis, origin)
+
+    # Step 2: world-bbox min corner AFTER rotation. The rotation maps
+    # native (x, y, z) -> world (-z, y, x), so the world MIN corner comes
+    # from native (min_x, min_y, MAX_z) — not (min_x, min_y, min_z).
+    rotated_min = adsk.core.Point3D.create(
+        cm(-NATIVE_MAX[2]),
+        cm(NATIVE_MIN[1]),
+        cm(NATIVE_MIN[0]),
+    )
+
+    # Step 3: translation lands rotated min corner at the cradle interior's
+    # back-left-floor corner: (CRADLE_X0, (OUTER_W - 115.5)/2, FLOOR_T).
+    case_w_actual = NATIVE_MAX[1] - NATIVE_MIN[1]   # 115.5 mm
+    target_min_x = cm(CRADLE_X0)
+    target_min_y = cm((OUTER_W - case_w_actual) / 2.0)
+    target_min_z = cm(FLOOR_T)
+    trans_mat = adsk.core.Matrix3D.create()
+    trans_mat.translation = adsk.core.Vector3D.create(
+        target_min_x - rotated_min.x,
+        target_min_y - rotated_min.y,
+        target_min_z - rotated_min.z,
+    )
+
+    # Step 4: build M = T * R (translate after rotating). transformBy is
+    # post-multiply, so we start with T and post-multiply by R.
+    tx = adsk.core.Matrix3D.create()
+    tx.transformBy(trans_mat)   # tx = T
+    tx.transformBy(rot)         # tx = T * R  (rotate first, then translate)
+
+    case_occ.transform2 = tx
+    case_occ.component.name = "supercase_imported"
+    return case_occ
+
+
 def buildBayLidAndBosses(comp):
     """Removable lid for the rear bay only (cradle stays open to let case
     breathe). 4 corner bosses with M3 self-tap pilots inside the bay corners."""
@@ -459,6 +573,15 @@ def run(context):
         buildBayLidAndBosses(comp)
         buildFloorChannel(comp)
         buildChassisMountHoles(comp)
+
+        # Polish: fillet outer vertical corners (purely cosmetic + makes the
+        # part nicer to print — no sharp internal corners on the print bed).
+        n_filleted = filletOuterCorners(comp, 3.0)
+
+        # Insert the Super Case STEP and drop it in the cradle for visual
+        # verification of clearances. Skipped silently if the cad repo isn't
+        # cloned to its expected location.
+        case_occ = importSuperCase(app, design, comp)
 
         ui.messageBox(
             "rcpilot_carrier_tray v1: build complete.\n\n"
