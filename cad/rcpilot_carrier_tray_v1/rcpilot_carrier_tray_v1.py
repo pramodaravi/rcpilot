@@ -42,6 +42,12 @@ import traceback
 # Parameters
 # =====================================================================
 
+# --- Toggles ---
+# Set True to also import the Super Case STEP into the same document for
+# clearance verification. Default False so the script produces ONLY the tray
+# (your product), keeping it cleanly separate from the upstream Super Case.
+IMPORT_SUPER_CASE = False
+
 # --- Super Case (REAL dims, parsed from V2.1 STEP CARTESIAN_POINT bbox) ---
 # crussella0129 V2.1 native bbox is 70 x 115.5 x 119 mm (a vertical desktop
 # tower). For the RC car we lay it on its side so the tallest dim (119) runs
@@ -120,8 +126,11 @@ BAY_X1    = BAY_X0 + BAY_DEPTH_X
 SEP_X0    = BAY_X1
 SEP_X1    = SEP_X0 + CRADLE_WALL_T   # the cradle's back wall is the bay's
                                        # front wall
-CRADLE_X0 = SEP_X1
-CRADLE_X1 = CRADLE_X0 + CASE_L + 2 * CASE_CLEARANCE
+CRADLE_X0 = SEP_X1   # X of cradle BACK wall's outer face
+# CRADLE_X1 spans the back wall PLUS the case PLUS 2x clearance. The earlier
+# version omitted CRADLE_WALL_T which left the cradle interior 3mm too short
+# and caused the imported case to clip through the back wall.
+CRADLE_X1 = CRADLE_X0 + CRADLE_WALL_T + CASE_L + 2 * CASE_CLEARANCE
 FRONT_X   = CRADLE_X1 + FACE_T
 
 OUTER_L = FRONT_X
@@ -469,7 +478,9 @@ def importSuperCase(app, design, comp):
     # Step 3: translation lands rotated min corner at the cradle interior's
     # back-left-floor corner: (CRADLE_X0, (OUTER_W - 115.5)/2, FLOOR_T).
     case_w_actual = NATIVE_MAX[1] - NATIVE_MIN[1]   # 115.5 mm
-    target_min_x = cm(CRADLE_X0)
+    # Sit the case 1mm in from the cradle's back wall inner face (which is at
+    # X = CRADLE_X0 + CRADLE_WALL_T) so the case does NOT overlap the wall.
+    target_min_x = cm(CRADLE_X0 + CRADLE_WALL_T + CASE_CLEARANCE)
     target_min_y = cm((OUTER_W - case_w_actual) / 2.0)
     target_min_z = cm(FLOOR_T)
     trans_mat = adsk.core.Matrix3D.create()
@@ -578,10 +589,10 @@ def run(context):
         # part nicer to print — no sharp internal corners on the print bed).
         n_filleted = filletOuterCorners(comp, 3.0)
 
-        # Insert the Super Case STEP and drop it in the cradle for visual
-        # verification of clearances. Skipped silently if the cad repo isn't
-        # cloned to its expected location.
-        case_occ = importSuperCase(app, design, comp)
+        # Optionally drop the Super Case STEP into the cradle for visual
+        # clearance verification. OFF by default so the output document
+        # contains only the tray — see IMPORT_SUPER_CASE at the top.
+        case_occ = importSuperCase(app, design, comp) if IMPORT_SUPER_CASE else None
 
         ui.messageBox(
             "rcpilot_carrier_tray v1: build complete.\n\n"
