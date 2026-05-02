@@ -85,46 +85,37 @@ namespace RcPilot.Video
 
             cockpitRoot = new GameObject("Cockpit");
 
-            // Widescreen layout: two equal-sized Quads side-by-side, each
-            // showing one camera. Slight inward yaw (±8°) wraps the view a bit
-            // so it feels like a real curved windshield instead of a flat
-            // letterbox. If only cam0 is enabled (cam1Port == 0), the right
-            // Quad still gets built — it just shows the cam1 "no signal"
-            // pattern until a second camera is wired up.
+            // Seamless widescreen: ONE wide Quad rendered with a custom shader
+            // (Assets/Shaders/RcPilotWidescreen.shader) that samples cam0 on
+            // the left half, cam1 on the right half, and feathers the seam
+            // with a linear alpha blend so the discontinuity disappears.
             //
-            //   left  half = cam0 at X = -0.7 m
-            //   right half = cam1 at X = +0.7 m
-            //   each Quad: 1.45 m wide x 1.6 m tall
-            //   tiny gap (0.05 m) between them so there's a visible seam.
-            const float kHalfWidth = 1.45f;
-            const float kHeight    = 1.60f;
-            const float kCenterZ   = 1.50f;
-            const float kCenterY   = 1.25f;
-            const float kHalfGap   = 0.05f;   // half of total seam gap
-            const float kYaw       = 8f;      // degrees, inward
-            float xOffset = (kHalfWidth / 2f) + kHalfGap;
+            //   Quad size: 3.0 m wide x 1.6 m tall (centered at driver's eye)
+            //   Position : (0, 1.25, 1.5)
+            //   Shader   : RcPilot/Widescreen2Cam — see _BlendWidth, _SeamShift
+            //              properties for fine-tuning if cameras don't line up.
+            const float kWidth   = 3.00f;
+            const float kHeight  = 1.60f;
+            const float kCenterZ = 1.50f;
+            const float kCenterY = 1.25f;
 
-            mainScreen = BuildScreenQuad("MainScreen_Cam0", cockpitRoot.transform,
-                new Vector3(-xOffset, kCenterY, kCenterZ),
-                new Vector3(0f, +kYaw, 0f),
-                new Vector3(kHalfWidth, kHeight, 1f), cam0Tex);
+            mainScreen = BuildWidescreenQuad("Windshield_Widescreen",
+                cockpitRoot.transform,
+                new Vector3(0f, kCenterY, kCenterZ),
+                new Vector3(kWidth, kHeight, 1f),
+                cam0Tex, cam1Tex);
             mainScreenRenderer = mainScreen.GetComponent<MeshRenderer>();
 
-            secondaryScreen = BuildScreenQuad("MainScreen_Cam1", cockpitRoot.transform,
-                new Vector3(+xOffset, kCenterY, kCenterZ),
-                new Vector3(0f, -kYaw, 0f),
-                new Vector3(kHalfWidth, kHeight, 1f), cam1Tex);
-            secondaryScreenRenderer = secondaryScreen.GetComponent<MeshRenderer>();
+            // The "secondary screen" reference is kept null in widescreen mode
+            // — there's only one screen now. ToggleMain() and SetCameraSource()
+            // still work via _cam0Source / _cam1Source.
+            secondaryScreen = null;
+            secondaryScreenRenderer = null;
 
             // BuggyCockpit aligns its 3D buggy model to a "windshield" Transform.
-            // Pre-widescreen we passed it mainScreen (which was centered).
-            // Now mainScreen is off to the left, so we make an invisible
-            // centered reference between the two Quads at the same depth.
-            var windshieldRef = new GameObject("WindshieldCenter").transform;
-            windshieldRef.SetParent(cockpitRoot.transform, false);
-            windshieldRef.localPosition = new Vector3(0f, kCenterY, kCenterZ);
-            windshieldRef.localScale = new Vector3(2f * kHalfWidth + 2f * kHalfGap,
-                                                    kHeight, 1f);
+            // The single widescreen Quad is already centered, so we just
+            // pass mainScreen.
+            var windshieldRef = mainScreen;
 
             // Floor — dark closure below the cockpit so the lower edge of the
             // view doesn't leak the bare scene background.
@@ -231,9 +222,27 @@ namespace RcPilot.Video
 
         private void RebindScreens()
         {
+            // In single-Quad widescreen mode, mainScreenRenderer holds a
+            // material with the RcPilot/Widescreen2Cam shader — both camera
+            // textures get bound on it via _LeftTex / _RightTex.
             if (mainScreenRenderer != null)
-                AssignMainTexture(mainScreenRenderer.material,
-                                  _cam0IsMain ? _cam0Source : _cam1Source);
+            {
+                var mat = mainScreenRenderer.material;
+                if (mat.HasProperty("_LeftTex"))
+                {
+                    // Widescreen shader: left cam = cam0, right cam = cam1.
+                    // ToggleMain swaps which feed lands on which side.
+                    Texture leftTex  = _cam0IsMain ? _cam0Source : _cam1Source;
+                    Texture rightTex = _cam0IsMain ? _cam1Source : _cam0Source;
+                    mat.SetTexture("_LeftTex",  leftTex);
+                    mat.SetTexture("_RightTex", rightTex);
+                }
+                else
+                {
+                    // Single-texture fallback (e.g. shader missing): show cam0.
+                    AssignMainTexture(mat, _cam0IsMain ? _cam0Source : _cam1Source);
+                }
+            }
             if (secondaryScreenRenderer != null)
                 AssignMainTexture(secondaryScreenRenderer.material,
                                   _cam0IsMain ? _cam1Source : _cam0Source);
@@ -253,6 +262,46 @@ namespace RcPilot.Video
 
             var mat = new Material(FindUnlitShader());
             AssignMainTexture(mat, tex);
+            go.GetComponent<MeshRenderer>().material = mat;
+            return go.transform;
+        }
+
+        /// <summary>
+        /// Build the seamless widescreen Quad. Uses the custom
+        /// RcPilot/Widescreen2Cam shader to sample cam0 on the left half and
+        /// cam1 on the right half of the same Quad, with a feathered blend
+        /// across the seam. Falls back to a plain Unlit shader showing only
+        /// cam0 if the custom shader can't be found (e.g. shader file missing
+        /// from the project).
+        /// </summary>
+        private Transform BuildWidescreenQuad(string name, Transform parent,
+                                              Vector3 pos, Vector3 scale,
+                                              Texture leftTex, Texture rightTex)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            go.name = name;
+            Destroy(go.GetComponent<Collider>());
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = pos;
+            go.transform.localEulerAngles = Vector3.zero;
+            go.transform.localScale = scale;
+
+            Shader wide = Shader.Find("RcPilot/Widescreen2Cam");
+            Material mat;
+            if (wide != null)
+            {
+                mat = new Material(wide);
+                mat.SetTexture("_LeftTex",  leftTex);
+                mat.SetTexture("_RightTex", rightTex);
+            }
+            else
+            {
+                Log.Warn("Widescreen shader 'RcPilot/Widescreen2Cam' not found; "
+                       + "falling back to cam0-only Unlit. Make sure "
+                       + "Assets/Shaders/RcPilotWidescreen.shader is in the project.");
+                mat = new Material(FindUnlitShader());
+                AssignMainTexture(mat, leftTex);
+            }
             go.GetComponent<MeshRenderer>().material = mat;
             return go.transform;
         }
