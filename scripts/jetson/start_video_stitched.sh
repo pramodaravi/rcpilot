@@ -75,8 +75,7 @@ exec gst-launch-1.0 -v \
         sink_0::width=${WIDTH}  sink_0::height=${HEIGHT} \
         sink_1::xpos=${WIDTH}   sink_1::ypos=0 \
         sink_1::width=${WIDTH}  sink_1::height=${HEIGHT} \
-    comp. ! "video/x-raw(memory:NVMM),width=${OUT_W},height=${OUT_H},format=NV12,framerate=${FPS}/1" \
-    ! nvvidconv ! video/x-raw,format=I420 \
+    comp. ! nvvidconv ! video/x-raw,format=I420 \
     ! x264enc tune=zerolatency speed-preset=${X264_PRESET} \
         bitrate=${BITRATE_KBPS} key-int-max=${KEY_INTERVAL} bframes=0 \
         intra-refresh=true sliced-threads=true threads=4 byte-stream=true \
