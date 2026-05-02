@@ -260,9 +260,58 @@ class StitchPlan:
     left_y: int
     canvas_w: int
     canvas_h: int
+    crop_x: int
+    crop_y: int
+    crop_w: int
+    crop_h: int
     left_weight: np.ndarray
     right_weight: np.ndarray
+    overlap_mask: np.ndarray
+    overlap_pixels: int
+    exposure_match: bool
+    exposure_alpha: float
+    exposure_gain: np.ndarray
     use_cuda: bool
+
+
+def find_clean_crop(mask: np.ndarray,
+                    min_edge_coverage: float) -> Tuple[int, int, int, int]:
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        raise SystemExit("stitch coverage mask is empty")
+
+    x0 = int(xs.min())
+    x1 = int(xs.max()) + 1
+    y0 = int(ys.min())
+    y1 = int(ys.max()) + 1
+    original = (x0, y0, x1 - x0, y1 - y0)
+    min_edge_coverage = float(np.clip(min_edge_coverage, 0.80, 1.0))
+
+    # Trim one border pixel at a time until the visible crop has no obvious
+    # black wedge along its edges. This runs once at startup, not per frame.
+    while x1 - x0 > 16 and y1 - y0 > 16:
+        window = mask[y0:y1, x0:x1] > 0
+        edge_scores = {
+            "top": float(window[0, :].mean()),
+            "bottom": float(window[-1, :].mean()),
+            "left": float(window[:, 0].mean()),
+            "right": float(window[:, -1].mean()),
+        }
+        edge, score = min(edge_scores.items(), key=lambda item: item[1])
+        if score >= min_edge_coverage:
+            break
+        if edge == "top":
+            y0 += 1
+        elif edge == "bottom":
+            y1 -= 1
+        elif edge == "left":
+            x0 += 1
+        else:
+            x1 -= 1
+
+    if x1 - x0 < original[2] * 0.70 or y1 - y0 < original[3] * 0.70:
+        return original
+    return x0, y0, x1 - x0, y1 - y0
 
 
 def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
@@ -324,6 +373,24 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
     left_weight[only_right] = 0.0
     right_weight[only_right] = 1.0
 
+    coverage_mask = ((left_mask > 0) | (right_mask > 0)).astype(np.uint8)
+    overlap_mask = ((left_mask > 0) & (right_mask > 0)).astype(np.uint8) * 255
+    if np.count_nonzero(overlap_mask) > 0:
+        overlap_mask = cv2.erode(overlap_mask, np.ones((7, 7), dtype=np.uint8))
+    overlap_pixels = int(np.count_nonzero(overlap_mask))
+    if env_bool("RCPILOT_STITCH_CROP_BORDERS", True):
+        min_edge_coverage = env_float("RCPILOT_STITCH_CROP_EDGE_COVERAGE", 0.985)
+        crop_x, crop_y, crop_w, crop_h = find_clean_crop(
+            coverage_mask, min_edge_coverage
+        )
+    else:
+        crop_x, crop_y, crop_w, crop_h = 0, 0, canvas_w, canvas_h
+
+    exposure_match = env_bool("RCPILOT_STITCH_EXPOSURE_MATCH", True)
+    exposure_alpha = float(
+        np.clip(env_float("RCPILOT_STITCH_EXPOSURE_ALPHA", 0.08), 0.0, 1.0)
+    )
+
     cuda_ok = False
     if use_cuda and hasattr(cv2, "cuda"):
         try:
@@ -332,8 +399,10 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
             cuda_ok = False
 
     log.info(
-        "stitch canvas=%dx%d left_offset=(%d,%d) cuda_warp=%s",
-        canvas_w, canvas_h, tx, ty, cuda_ok,
+        "stitch canvas=%dx%d crop=(%d,%d %dx%d) left_offset=(%d,%d) "
+        "overlap_pixels=%d exposure_match=%s cuda_warp=%s",
+        canvas_w, canvas_h, crop_x, crop_y, crop_w, crop_h, tx, ty,
+        overlap_pixels, exposure_match, cuda_ok,
     )
     return StitchPlan(
         h_canvas=h_canvas.astype(np.float64),
@@ -341,10 +410,41 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
         left_y=ty,
         canvas_w=canvas_w,
         canvas_h=canvas_h,
+        crop_x=crop_x,
+        crop_y=crop_y,
+        crop_w=crop_w,
+        crop_h=crop_h,
         left_weight=left_weight,
         right_weight=right_weight,
+        overlap_mask=overlap_mask,
+        overlap_pixels=overlap_pixels,
+        exposure_match=exposure_match,
+        exposure_alpha=exposure_alpha,
+        exposure_gain=np.ones(3, dtype=np.float32),
         use_cuda=cuda_ok,
     )
+
+
+def match_right_exposure(canvas_l: np.ndarray, canvas_r: np.ndarray,
+                         plan: StitchPlan) -> np.ndarray:
+    if not plan.exposure_match or plan.overlap_pixels < 5000:
+        return canvas_r
+
+    left_mean = np.array(cv2.mean(canvas_l, mask=plan.overlap_mask)[:3],
+                         dtype=np.float32)
+    right_mean = np.array(cv2.mean(canvas_r, mask=plan.overlap_mask)[:3],
+                          dtype=np.float32)
+    if float(right_mean.max()) < 2.0 or float(left_mean.max()) < 2.0:
+        return canvas_r
+
+    target_gain = np.clip(left_mean / np.maximum(right_mean, 1.0), 0.70, 1.45)
+    plan.exposure_gain = (
+        plan.exposure_gain * (1.0 - plan.exposure_alpha)
+        + target_gain * plan.exposure_alpha
+    ).astype(np.float32)
+
+    adjusted = canvas_r.astype(np.float32) * plan.exposure_gain.reshape(1, 1, 3)
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 def stitch_frame(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
@@ -368,11 +468,16 @@ def stitch_frame(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
             flags=cv2.INTER_LINEAR,
         )
 
+    canvas_r = match_right_exposure(canvas_l, canvas_r, plan)
     stitched = (
         canvas_l.astype(np.float32) * plan.left_weight[..., None]
         + canvas_r.astype(np.float32) * plan.right_weight[..., None]
     )
     stitched = np.clip(stitched, 0, 255).astype(np.uint8)
+    stitched = stitched[
+        plan.crop_y:plan.crop_y + plan.crop_h,
+        plan.crop_x:plan.crop_x + plan.crop_w,
+    ]
 
     if stitched.shape[1] != out_w or stitched.shape[0] != out_h:
         stitched = cv2.resize(stitched, (out_w, out_h), interpolation=cv2.INTER_AREA)
@@ -609,10 +714,19 @@ def main() -> int:
 
             now = time.monotonic()
             if now - last_log >= 2.0:
-                log.info(
-                    "streaming stitched panorama: %.1f fps left=%d right=%d",
-                    frame_count / (now - last_log), left_count, right_count,
-                )
+                if plan.exposure_match:
+                    gain = plan.exposure_gain
+                    log.info(
+                        "streaming stitched panorama: %.1f fps left=%d right=%d "
+                        "gain_bgr=(%.2f,%.2f,%.2f)",
+                        frame_count / (now - last_log), left_count, right_count,
+                        gain[0], gain[1], gain[2],
+                    )
+                else:
+                    log.info(
+                        "streaming stitched panorama: %.1f fps left=%d right=%d",
+                        frame_count / (now - last_log), left_count, right_count,
+                    )
                 frame_count = 0
                 last_log = now
     finally:
