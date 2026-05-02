@@ -153,25 +153,48 @@ class CameraReader:
         return None, after_count
 
     def _loop(self) -> None:
+        retry_s = 1.0
+        read_failures = 0
+        max_retry_s = env_float("RCPILOT_CAMERA_RETRY_MAX_S", 6.0)
         while self._running.is_set():
             cap = cv2.VideoCapture(self.pipeline, cv2.CAP_GSTREAMER)
             if not cap.isOpened():
-                self.log.warning("%s camera open failed; retrying", self.label)
-                time.sleep(1.0)
+                self.log.warning(
+                    "%s camera open failed; retrying in %.1fs",
+                    self.label, retry_s,
+                )
+                time.sleep(retry_s)
+                retry_s = min(max_retry_s, retry_s * 1.6)
                 continue
             self.log.info("%s camera open", self.label)
+            frames_this_open = 0
             try:
                 while self._running.is_set():
                     ok, frame = cap.read()
                     if not ok or frame is None:
-                        self.log.warning("%s camera read failed; reopening", self.label)
+                        read_failures += 1
+                        self.log.warning(
+                            "%s camera read failed; reopening in %.1fs",
+                            self.label, retry_s,
+                        )
+                        if read_failures >= 4 and frames_this_open == 0:
+                            self.log.warning(
+                                "%s camera is opening but not delivering frames. "
+                                "If both cameras do this after a previous crash, "
+                                "restart nvargus-daemon on the Jetson.",
+                                self.label,
+                            )
                         break
                     with self._lock:
                         self._latest = frame
                         self._count += 1
+                    frames_this_open += 1
+                    read_failures = 0
+                    retry_s = 1.0
             finally:
                 cap.release()
-            time.sleep(0.25)
+            time.sleep(retry_s)
+            retry_s = min(max_retry_s, retry_s * 1.6)
 
 
 @dataclass
@@ -762,6 +785,7 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
     last_right: Optional[np.ndarray] = None
     last_left_count = -1
     last_right_count = -1
+    no_frame_samples = 0
 
     log.info(
         "estimating stitch alignment from %d fresh frame pairs "
@@ -776,8 +800,17 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
             timeout_s=3.0, after_count=last_right_count,
         )
         if left is None or right is None:
+            no_frame_samples += 1
             log.warning("calibration sample %d: no frame yet", idx + 1)
+            if no_frame_samples >= 5 and last_left is None and last_right is None:
+                raise SystemExit(
+                    "No frames arrived from the CSI cameras. Argus may still "
+                    "be holding a stale capture session from an earlier crash. "
+                    "Stop this process and run: sudo systemctl restart "
+                    "nvargus-daemon"
+                )
             continue
+        no_frame_samples = 0
         last_left = left
         last_right = right
         result = estimate_homography(left, right, feature_scale, min_matches, log)
