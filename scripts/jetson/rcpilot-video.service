@@ -26,11 +26,11 @@ WorkingDirectory=/home/adm2n/rcpilot
 # if the Wi-Fi link is unavailable for a session.
 Environment=RCPILOT_COCKPIT_IP=192.168.1.247
 ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video_stitched.sh
-# Use Restart=always (not on-failure) because GStreamer reports an EOS as a
-# clean exit (code 0) even when NvArgusCameraSrc failed to open. on-failure
-# would let the service stay dead in that case; always retries until the
-# camera is actually ready.
-Restart=always
+# Restart only on actual process failure. The current Python stitcher exits
+# non-zero for camera/open/calibration failures, and exits cleanly on SIGTERM
+# so manual testing with `systemctl stop rcpilot-video` or `pkill` does not
+# immediately respawn a second camera owner.
+Restart=on-failure
 RestartSec=3
 StandardOutput=journal
 StandardError=journal
