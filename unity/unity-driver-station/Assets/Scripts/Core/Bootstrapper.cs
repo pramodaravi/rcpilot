@@ -135,6 +135,18 @@ namespace RcPilot.Core
                 bridgeLauncher.jetsonIp = config.network.jetsonIp;
                 bridgeLauncher.outPort = config.video.cam0Port;
                 if (bridgeLauncher.autoStart) bridgeLauncher.Launch();
+
+                // Second bridge for cam1 (widescreen mode). The Jetson sends
+                // sensor 1's RTP stream to UDP 5006 (vs 5004 for cam0); this
+                // bridge decodes it and serves to TCP 9001 on localhost.
+                if (config.video.cam1Port > 0)
+                {
+                    var bridgeLauncher1 = gameObject.AddComponent<BridgeProcessLauncher>();
+                    bridgeLauncher1.jetsonIp = config.network.jetsonIp;
+                    bridgeLauncher1.inPort  = 5006;
+                    bridgeLauncher1.outPort = config.video.cam1Port;
+                    if (bridgeLauncher1.autoStart) bridgeLauncher1.Launch();
+                }
             }
             else
             {
@@ -148,11 +160,10 @@ namespace RcPilot.Core
 
             if (!config.sim.enabled)
             {
-                // V1: single IMX219 camera on the bench. The bridge is the
-                // python sidecar in video-bridge/ which decodes RTP H.264 from
-                // UDP 5004 and forwards JPEG frames over TCP 9000 to this
-                // client. cam1 is built only if config.video.cam1Port > 0
-                // (reserved for a future chase camera or rear view).
+                // Dual-camera bench (cam1Port > 0): cam0 on UDP 5004 -> TCP 9000,
+                // cam1 on UDP 5006 -> TCP 9001. Each bridge.py is a separate
+                // sidecar process. Cockpit displays them side-by-side as a
+                // widescreen windshield — see CockpitBuilder.
                 cam0 = gameObject.AddComponent<VideoBridgeClient>();
                 cam0.Configure("cam0", config.video.bridgeHost, config.video.cam0Port,
                                cockpit.GetCameraTexture(0));

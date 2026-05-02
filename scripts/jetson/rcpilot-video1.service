@@ -1,0 +1,32 @@
+[Unit]
+Description=rcpilot video sender — CAM1 (IMX219 sensor 1 -> RTP H.264 -> cockpit)
+Documentation=https://github.com/pramodaravi/rcpilot
+After=network-online.target
+Wants=network-online.target
+After=systemd-udev-settle.service
+# Don't start until cam0 is past its initial nvarguscamerasrc claim, otherwise
+# both pipelines race the nvargus-daemon and one fails with
+# "Failed to create CaptureSession". Delay 5 s after cam0's service start.
+After=rcpilot-video.service
+# Modern systemd requires these in [Unit], not [Service].
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=adm2n
+Group=adm2n
+WorkingDirectory=/home/adm2n/rcpilot
+# Same cockpit IP as CAM0; cam1 just goes to a different UDP port so the
+# cockpit's bridge can demux them.
+Environment=RCPILOT_COCKPIT_IP=192.168.1.247
+Environment=RCPILOT_SENSOR_ID=1
+Environment=RCPILOT_VIDEO_PORT=5006
+ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

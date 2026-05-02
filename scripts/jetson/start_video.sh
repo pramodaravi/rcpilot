@@ -15,6 +15,7 @@
 # Env vars (with defaults):
 #   RCPILOT_COCKPIT_IP       (REQUIRED)         Where to send the video stream.
 #   RCPILOT_VIDEO_PORT       5004               UDP port on the cockpit.
+#   RCPILOT_SENSOR_ID        0                  CSI port: 0 (CAM0) or 1 (CAM1).
 #   RCPILOT_VIDEO_WIDTH      1280
 #   RCPILOT_VIDEO_HEIGHT     720
 #   RCPILOT_VIDEO_FPS        60
@@ -40,6 +41,7 @@ if [[ -z "${RCPILOT_COCKPIT_IP:-}" ]]; then
 fi
 
 PORT="${RCPILOT_VIDEO_PORT:-5004}"
+SENSOR_ID="${RCPILOT_SENSOR_ID:-0}"
 WIDTH="${RCPILOT_VIDEO_WIDTH:-1280}"
 HEIGHT="${RCPILOT_VIDEO_HEIGHT:-720}"
 FPS="${RCPILOT_VIDEO_FPS:-60}"
@@ -59,7 +61,7 @@ X264_PRESET="${RCPILOT_X264_PRESET:-superfast}"
 cat <<INFO >&2
 ====================================================
   rcpilot video sender
-  Source:    IMX219 CSI, sensor-mode=${SENSOR_MODE}
+  Source:    IMX219 CSI, sensor-id=${SENSOR_ID}, sensor-mode=${SENSOR_MODE}
   Capture:   ${WIDTH}x${HEIGHT}@${FPS}
   Encoder:   ${ENCODER}
   Bitrate:   ${BITRATE_KBPS} kbps
@@ -100,7 +102,7 @@ case "${ENCODER}" in
 esac
 
 exec gst-launch-1.0 -v \
-    nvarguscamerasrc sensor-id=0 sensor-mode="${SENSOR_MODE}" \
+    nvarguscamerasrc sensor-id="${SENSOR_ID}" sensor-mode="${SENSOR_MODE}" \
         exposuretimerange="100000 10000000" \
         aelock=false \
     ! "video/x-raw(memory:NVMM),width=${WIDTH},height=${HEIGHT},framerate=${FPS}/1,format=NV12" \

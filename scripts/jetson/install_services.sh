@@ -21,7 +21,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SYSTEMD_DIR=/etc/systemd/system
 
-for svc in rcpilot-echo.service rcpilot-video.service; do
+for svc in rcpilot-echo.service rcpilot-video.service rcpilot-video1.service; do
     src="${SCRIPT_DIR}/${svc}"
     dst="${SYSTEMD_DIR}/${svc}"
     if [[ ! -f "$src" ]]; then
@@ -33,9 +33,10 @@ for svc in rcpilot-echo.service rcpilot-video.service; do
 done
 
 systemctl daemon-reload
-systemctl enable --now rcpilot-echo.service rcpilot-video.service
+systemctl enable --now rcpilot-echo.service rcpilot-video.service rcpilot-video1.service
 
 echo
 echo "Services installed and started. Check status with:"
 echo "  systemctl status rcpilot-echo"
-echo "  systemctl status rcpilot-video"
+echo "  systemctl status rcpilot-video    # cam0 on UDP 5004"
+echo "  systemctl status rcpilot-video1   # cam1 on UDP 5006"

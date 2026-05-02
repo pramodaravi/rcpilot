@@ -4,17 +4,18 @@ using RcPilot.Core;
 namespace RcPilot.Video
 {
     /// <summary>
-    /// Procedurally constructs a simple racing cockpit: a dark interior with
-    /// a wide "windshield" showing cam0, a smaller rear-view / secondary feed
-    /// showing cam1, and a glowing dashboard below. All geometry is quads —
-    /// we're not trying to be Forza, we're trying to feel like a driving-sim
-    /// cockpit around a live telemetry feed.
+    /// Procedurally constructs a dual-camera widescreen cockpit: two equal-sized
+    /// Quads side-by-side forming a wide "windshield" (left half = cam0, right
+    /// half = cam1), with the BuggyCockpit 3D model layered in front for the
+    /// dash + steering wheel. Each Quad has slight inward yaw so the seam looks
+    /// like a real curved windshield instead of a flat letterbox.
     ///
     /// Camera feeds are Texture2D objects owned by this component; the
     /// VideoBridgeClient blits into them each frame, and the cockpit's unlit
     /// materials sample them directly.
     ///
-    /// Toggle-cam (C or wheel button) swaps which feed is the "main" view.
+    /// Toggle-cam (C or wheel button) swaps which feed is on which side —
+    /// useful for reversing direction or correcting a swapped CSI ribbon.
     /// </summary>
     public class CockpitBuilder : MonoBehaviour
     {
@@ -84,17 +85,46 @@ namespace RcPilot.Video
 
             cockpitRoot = new GameObject("Cockpit");
 
-            // Main screen = cam0 — big, wide, slightly ahead of driver
-            mainScreen = BuildScreenQuad("MainScreen", cockpitRoot.transform,
-                new Vector3(0, 1.25f, 1.5f), new Vector3(0, 0, 0),
-                new Vector3(2.8f, 1.6f, 1f), cam0Tex);
+            // Widescreen layout: two equal-sized Quads side-by-side, each
+            // showing one camera. Slight inward yaw (±8°) wraps the view a bit
+            // so it feels like a real curved windshield instead of a flat
+            // letterbox. If only cam0 is enabled (cam1Port == 0), the right
+            // Quad still gets built — it just shows the cam1 "no signal"
+            // pattern until a second camera is wired up.
+            //
+            //   left  half = cam0 at X = -0.7 m
+            //   right half = cam1 at X = +0.7 m
+            //   each Quad: 1.45 m wide x 1.6 m tall
+            //   tiny gap (0.05 m) between them so there's a visible seam.
+            const float kHalfWidth = 1.45f;
+            const float kHeight    = 1.60f;
+            const float kCenterZ   = 1.50f;
+            const float kCenterY   = 1.25f;
+            const float kHalfGap   = 0.05f;   // half of total seam gap
+            const float kYaw       = 8f;      // degrees, inward
+            float xOffset = (kHalfWidth / 2f) + kHalfGap;
+
+            mainScreen = BuildScreenQuad("MainScreen_Cam0", cockpitRoot.transform,
+                new Vector3(-xOffset, kCenterY, kCenterZ),
+                new Vector3(0f, +kYaw, 0f),
+                new Vector3(kHalfWidth, kHeight, 1f), cam0Tex);
             mainScreenRenderer = mainScreen.GetComponent<MeshRenderer>();
 
-            // Secondary screen = cam1 — smaller, up-and-right like a rearview
-            secondaryScreen = BuildScreenQuad("SecondaryScreen", cockpitRoot.transform,
-                new Vector3(1.3f, 1.7f, 1.3f), new Vector3(5f, -18f, 0f),
-                new Vector3(0.9f, 0.5f, 1f), cam1Tex);
+            secondaryScreen = BuildScreenQuad("MainScreen_Cam1", cockpitRoot.transform,
+                new Vector3(+xOffset, kCenterY, kCenterZ),
+                new Vector3(0f, -kYaw, 0f),
+                new Vector3(kHalfWidth, kHeight, 1f), cam1Tex);
             secondaryScreenRenderer = secondaryScreen.GetComponent<MeshRenderer>();
+
+            // BuggyCockpit aligns its 3D buggy model to a "windshield" Transform.
+            // Pre-widescreen we passed it mainScreen (which was centered).
+            // Now mainScreen is off to the left, so we make an invisible
+            // centered reference between the two Quads at the same depth.
+            var windshieldRef = new GameObject("WindshieldCenter").transform;
+            windshieldRef.SetParent(cockpitRoot.transform, false);
+            windshieldRef.localPosition = new Vector3(0f, kCenterY, kCenterZ);
+            windshieldRef.localScale = new Vector3(2f * kHalfWidth + 2f * kHalfGap,
+                                                    kHeight, 1f);
 
             // Floor — dark closure below the cockpit so the lower edge of the
             // view doesn't leak the bare scene background.
@@ -112,7 +142,7 @@ namespace RcPilot.Video
             // V2 (VirtualCockpitV2) is kept on disk for reference but no
             // longer instantiated. To revert: change the line below back to
             //   cockpitRoot.AddComponent<VirtualCockpitV2>().Build(...)
-            cockpitRoot.AddComponent<BuggyCockpit>().Build(cockpitRoot.transform, cfg, mainScreen);
+            cockpitRoot.AddComponent<BuggyCockpit>().Build(cockpitRoot.transform, cfg, windshieldRef);
         }
 
         /// <summary>
