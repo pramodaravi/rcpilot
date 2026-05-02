@@ -1,5 +1,5 @@
 [Unit]
-Description=rcpilot video sender (IMX219 -> RTP H.264 -> cockpit)
+Description=rcpilot dual-camera stitched video sender (IMX219 x2 -> nvcompositor -> RTP H.264 -> cockpit)
 Documentation=https://github.com/pramodaravi/rcpilot
 After=network-online.target
 Wants=network-online.target
@@ -25,7 +25,7 @@ WorkingDirectory=/home/adm2n/rcpilot
 # The previous USB-C cockpit IP was 192.168.55.100; switch back via a drop-in
 # if the Wi-Fi link is unavailable for a session.
 Environment=RCPILOT_COCKPIT_IP=192.168.1.247
-ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video.sh
+ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video_stitched.sh
 # Use Restart=always (not on-failure) because GStreamer reports an EOS as a
 # clean exit (code 0) even when NvArgusCameraSrc failed to open. on-failure
 # would let the service stay dead in that case; always retries until the

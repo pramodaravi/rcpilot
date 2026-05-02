@@ -9,8 +9,8 @@
   "video": {
     "bridgeHost": "127.0.0.1",
     "cam0Port": 9000,
-    "cam1Port": 9001,
-    "texWidth": 1280,
+    "cam1Port": 0,
+    "texWidth": 2560,
     "texHeight": 720
   },
   "wheel": {

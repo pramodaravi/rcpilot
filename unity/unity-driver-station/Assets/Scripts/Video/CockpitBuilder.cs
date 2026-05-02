@@ -85,36 +85,32 @@ namespace RcPilot.Video
 
             cockpitRoot = new GameObject("Cockpit");
 
-            // Seamless widescreen: ONE wide Quad rendered with a custom shader
-            // (Assets/Shaders/RcPilotWidescreen.shader) that samples cam0 on
-            // the left half, cam1 on the right half, and feathers the seam
-            // with a linear alpha blend so the discontinuity disappears.
+            // The Jetson stitches both IMX219 cameras into one 2560x720 stream
+            // via nvcompositor BEFORE encoding (see scripts/jetson/start_video_stitched.sh).
+            // The cockpit therefore sees ONE wide video and renders it on a
+            // single ultra-wide Quad — no shader gymnastics, no duplicated
+            // middle. cam1Tex is no longer used (cam1Port = 0); ToggleMain
+            // becomes a no-op in this mode.
             //
-            //   Quad size: 3.0 m wide x 1.6 m tall (centered at driver's eye)
+            //   Quad size: 3.5 m wide x 1.0 m tall (~3.5:1 to match 2560x720)
             //   Position : (0, 1.25, 1.5)
-            //   Shader   : RcPilot/Widescreen2Cam — see _BlendWidth, _SeamShift
-            //              properties for fine-tuning if cameras don't line up.
-            const float kWidth   = 3.00f;
-            const float kHeight  = 1.60f;
+            const float kWidth   = 3.50f;
+            const float kHeight  = 1.00f;
             const float kCenterZ = 1.50f;
             const float kCenterY = 1.25f;
 
-            mainScreen = BuildWidescreenQuad("Windshield_Widescreen",
+            mainScreen = BuildScreenQuad("Windshield_Stitched",
                 cockpitRoot.transform,
                 new Vector3(0f, kCenterY, kCenterZ),
-                new Vector3(kWidth, kHeight, 1f),
-                cam0Tex, cam1Tex);
+                Vector3.zero,
+                new Vector3(kWidth, kHeight, 1f), cam0Tex);
             mainScreenRenderer = mainScreen.GetComponent<MeshRenderer>();
 
-            // The "secondary screen" reference is kept null in widescreen mode
-            // — there's only one screen now. ToggleMain() and SetCameraSource()
-            // still work via _cam0Source / _cam1Source.
+            // No secondary screen in stitched mode — the stitch happens on
+            // the Jetson, the cockpit sees one feed.
             secondaryScreen = null;
             secondaryScreenRenderer = null;
 
-            // BuggyCockpit aligns its 3D buggy model to a "windshield" Transform.
-            // The single widescreen Quad is already centered, so we just
-            // pass mainScreen.
             var windshieldRef = mainScreen;
 
             // Floor — dark closure below the cockpit so the lower edge of the

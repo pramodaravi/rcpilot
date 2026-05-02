@@ -21,7 +21,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SYSTEMD_DIR=/etc/systemd/system
 
-for svc in rcpilot-echo.service rcpilot-video.service rcpilot-video1.service; do
+for svc in rcpilot-echo.service rcpilot-video.service; do
     src="${SCRIPT_DIR}/${svc}"
     dst="${SYSTEMD_DIR}/${svc}"
     if [[ ! -f "$src" ]]; then
@@ -32,11 +32,18 @@ for svc in rcpilot-echo.service rcpilot-video.service rcpilot-video1.service; do
     echo "installed $dst"
 done
 
+# rcpilot-video1.service is from the previous dual-stream architecture; remove
+# any stale copy so it doesn't fight rcpilot-video for sensor 1.
+if [[ -f "${SYSTEMD_DIR}/rcpilot-video1.service" ]]; then
+    systemctl disable --now rcpilot-video1.service 2>/dev/null || true
+    rm -f "${SYSTEMD_DIR}/rcpilot-video1.service"
+    echo "removed legacy /etc/systemd/system/rcpilot-video1.service"
+fi
+
 systemctl daemon-reload
-systemctl enable --now rcpilot-echo.service rcpilot-video.service rcpilot-video1.service
+systemctl enable --now rcpilot-echo.service rcpilot-video.service
 
 echo
 echo "Services installed and started. Check status with:"
 echo "  systemctl status rcpilot-echo"
-echo "  systemctl status rcpilot-video    # cam0 on UDP 5004"
-echo "  systemctl status rcpilot-video1   # cam1 on UDP 5006"
+echo "  systemctl status rcpilot-video    # dual-cam stitched on UDP 5004"
