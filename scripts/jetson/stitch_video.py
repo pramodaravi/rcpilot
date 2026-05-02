@@ -268,6 +268,11 @@ class StitchPlan:
     right_weight: np.ndarray
     overlap_mask: np.ndarray
     overlap_pixels: int
+    # Raw per-camera coverage at canvas resolution, captured BEFORE feather
+    # narrowing snaps weights to 1/0 — needed by the seam-finder so it knows
+    # the *full* width of the overlap, not just the narrow feather band.
+    raw_left_coverage: np.ndarray
+    raw_right_coverage: np.ndarray
     exposure_match: bool
     exposure_alpha: float
     exposure_gain: np.ndarray
@@ -290,6 +295,30 @@ class StitchPlan:
     fast_overlap_mask_out: Optional[np.ndarray] = None
     # How often to refresh the exposure gain in fast mode (frames).
     fast_exposure_every_n: int = 15
+
+    # ---- seam-cut state (built by bake_fast_path, mutated each frame) -----
+    # Per-row [first_col, last_col+1) range of overlap pixels for each output
+    # row. Outside this range, the row is single-camera; the dynamic seam is
+    # only computed within these columns.
+    fast_overlap_row_lo: Optional[np.ndarray] = None  # (out_h,) int32
+    fast_overlap_row_hi: Optional[np.ndarray] = None  # (out_h,) int32
+    # Bounding box of the overlap region in output coords.
+    fast_overlap_xmin: int = 0
+    fast_overlap_xmax: int = 0
+    # Single-channel uint8 mask: 255 where the OUTPUT pixel is covered by at
+    # least one camera (so we can blank uncovered pixels to black at the end).
+    fast_covered_mask: Optional[np.ndarray] = None
+    # Single-channel uint8 [0..255] = baseline left weight, valid OUTSIDE the
+    # overlap band only. Inside the overlap, the per-frame seam logic writes
+    # the weight directly. Outside, this is 255 in left-only region, 0 in
+    # right-only, 0 in uncovered.
+    fast_baseline_left_u8: Optional[np.ndarray] = None
+    # Last frame's seam columns, kept for temporal smoothing.
+    fast_seam_prev: Optional[np.ndarray] = None  # (out_h,) int32
+    # How aggressively to smooth the seam frame-to-frame. 0 = no smoothing
+    # (latest seam every frame), 1 = freeze (never update). Default 0.6 →
+    # ~3-frame settling time, plenty fast for hand motion at 30fps.
+    fast_seam_smooth: float = 0.6
 
 
 def find_clean_crop(mask: np.ndarray,
@@ -459,6 +488,8 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
         right_weight=right_weight,
         overlap_mask=overlap_mask,
         overlap_pixels=overlap_pixels,
+        raw_left_coverage=(left_mask > 0).astype(np.uint8) * 255,
+        raw_right_coverage=(right_mask > 0).astype(np.uint8) * 255,
         exposure_match=exposure_match,
         exposure_alpha=exposure_alpha,
         exposure_gain=np.ones(3, dtype=np.float32),
@@ -594,9 +625,79 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     plan.fast_weight_left_bgr = cv2.merge([lw_u8, lw_u8, lw_u8])
     plan.fast_weight_right_bgr = cv2.merge([rw_u8, rw_u8, rw_u8])
 
-    # Cheap exposure sampling mask: pixels where both contribute meaningfully.
-    overlap_out = ((lw_u8 > 32) & (rw_u8 > 32)).astype(np.uint8) * 255
-    plan.fast_overlap_mask_out = overlap_out
+    # Pre-feather "raw" left and right coverage at canvas resolution: where
+    # each camera actually has pixels, before any feather narrowing snapped
+    # the weights to 1/0. We need this for seam-finding because the feather
+    # pass collapses the soft overlap band; the seam-finder wants the *full*
+    # overlap so it can route around foreground objects.
+    raw_l = plan.raw_left_coverage
+    raw_r = plan.raw_right_coverage
+    raw_overlap = ((raw_l > 0) & (raw_r > 0)).astype(np.uint8) * 255
+    raw_covered = ((raw_l > 0) | (raw_r > 0)).astype(np.uint8) * 255
+    raw_left_only = ((raw_l > 0) & (raw_r == 0)).astype(np.uint8) * 255
+
+    cropped_overlap = raw_overlap[
+        plan.crop_y:plan.crop_y + plan.crop_h,
+        plan.crop_x:plan.crop_x + plan.crop_w,
+    ]
+    cropped_covered = raw_covered[
+        plan.crop_y:plan.crop_y + plan.crop_h,
+        plan.crop_x:plan.crop_x + plan.crop_w,
+    ]
+    cropped_left_only = raw_left_only[
+        plan.crop_y:plan.crop_y + plan.crop_h,
+        plan.crop_x:plan.crop_x + plan.crop_w,
+    ]
+    plan.fast_overlap_mask_out = cv2.resize(
+        cropped_overlap, (out_w, out_h), interpolation=cv2.INTER_NEAREST,
+    )
+    plan.fast_covered_mask = cv2.resize(
+        cropped_covered, (out_w, out_h), interpolation=cv2.INTER_NEAREST,
+    )
+
+    # Baseline left weight valid OUTSIDE the overlap band: 255 in left-only
+    # region, 0 elsewhere. Inside the overlap, the per-frame seam logic
+    # supersedes this. Use the *raw* left-only mask (where left covers and
+    # right does not) so the boundary lines up with the overlap_mask above.
+    baseline = cv2.resize(cropped_left_only, (out_w, out_h),
+                          interpolation=cv2.INTER_NEAREST)
+    plan.fast_baseline_left_u8 = baseline
+
+    # Per-row overlap range, used to skip-DP rows that have no overlap.
+    overlap_bool = overlap_out > 0
+    if overlap_bool.any():
+        row_any = overlap_bool.any(axis=1)
+        # For rows that have any overlap, find first and last True column.
+        # Use argmax tricks for speed: argmax on bool returns first True.
+        col_idx = np.arange(out_w)
+        # row_lo[r] = first col where overlap_bool[r] is True (or -1 if none)
+        first_col = np.where(row_any,
+                             overlap_bool.argmax(axis=1),
+                             -1).astype(np.int32)
+        # last_col[r] = last col where overlap_bool[r] is True
+        # Reverse trick: argmax on reversed gives the position from right.
+        rev = overlap_bool[:, ::-1]
+        last_col = np.where(row_any,
+                            (out_w - 1) - rev.argmax(axis=1),
+                            -1).astype(np.int32)
+        plan.fast_overlap_row_lo = first_col
+        plan.fast_overlap_row_hi = (last_col + 1).astype(np.int32)
+        plan.fast_overlap_xmin = int(first_col[row_any].min())
+        plan.fast_overlap_xmax = int(last_col[row_any].max()) + 1
+    else:
+        plan.fast_overlap_row_lo = np.full(out_h, -1, dtype=np.int32)
+        plan.fast_overlap_row_hi = np.full(out_h, -1, dtype=np.int32)
+        plan.fast_overlap_xmin = 0
+        plan.fast_overlap_xmax = 0
+
+    # Initial seam guess: midpoint of each row's overlap. Smoothed each frame.
+    seam_init = np.where(
+        plan.fast_overlap_row_lo >= 0,
+        (plan.fast_overlap_row_lo.astype(np.int64)
+         + plan.fast_overlap_row_hi.astype(np.int64) - 1) // 2,
+        0,
+    ).astype(np.int32)
+    plan.fast_seam_prev = seam_init
 
     plan.fast_map_left_x = left_sx
     plan.fast_map_left_y = left_sy
@@ -604,15 +705,196 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     plan.fast_map_right_y = rsy
 
     log.info(
-        "fast-path baked: out=%dx%d remap_tables=2 overlap_out_pixels=%d "
-        "exposure_every_n=%d",
-        out_w, out_h, int((overlap_out > 0).sum()), plan.fast_exposure_every_n,
+        "fast-path baked: out=%dx%d remap_tables=2 overlap_pixels=%d "
+        "overlap_xrange=[%d,%d) exposure_every_n=%d",
+        out_w, out_h, int((overlap_out > 0).sum()),
+        plan.fast_overlap_xmin, plan.fast_overlap_xmax,
+        plan.fast_exposure_every_n,
     )
 
 
+def find_dynamic_seam(warped_left: np.ndarray, warped_right: np.ndarray,
+                      plan: StitchPlan, downscale: int = 2) -> np.ndarray:
+    """Return a per-row column position for a minimum-disagreement seam
+    through the overlap band.
+
+    Where left and right cameras agree (background, well-aligned by the
+    homography), pixel-difference is small. Where they disagree (parallax-
+    affected foreground like a hand reaching toward the cameras), it's
+    large. A vertical dynamic-program seam through the cost map naturally
+    routes around the disagreement region, putting the hand in exactly one
+    camera instead of double-blending it.
+
+    `downscale` runs the cost+DP at half/quarter resolution for speed; the
+    seam is upscaled back to output rows. 1 = full res, 2 = half (default).
+    """
+    out_h, out_w = warped_left.shape[:2]
+    xmin = plan.fast_overlap_xmin
+    xmax = plan.fast_overlap_xmax
+    if xmax <= xmin:
+        # No overlap — every output row is single-camera, no seam needed.
+        return plan.fast_seam_prev
+
+    # Crop to overlap bounding box for faster work.
+    band_l = warped_left[:, xmin:xmax]
+    band_r = warped_right[:, xmin:xmax]
+    # Sum-of-channel-abs-diff is a cheap "do these cameras agree" metric,
+    # used as the BASE cost.
+    diff = cv2.absdiff(band_l, band_r)
+    diff_sum = diff.sum(axis=2).astype(np.int32)
+
+    # CRUCIAL: where a foreground object (like a hand) appears in BOTH
+    # cameras at different positions, the *interior* of the doubled-object
+    # region can have low pixel-diff (both cameras show "hand pixels", even
+    # though they're different parts of the hand). The DISAGREEMENT shows
+    # only at the object's silhouette boundaries. To prevent the seam from
+    # cutting through the middle of a foreground object, threshold and
+    # dilate the disagreement boundaries into a wide no-fly zone, then
+    # treat that whole zone as high cost.
+    disagree_thr = 24  # below this is "background agreement"
+    forbidden = (diff_sum > disagree_thr).astype(np.uint8) * 255
+    # Dilate horizontally a lot, vertically less. Parallax is mostly
+    # horizontal (cameras side-by-side), so the no-fly zone needs to be
+    # wide enough to bridge the hand's two image positions.
+    band_w = xmax - xmin
+    h_kernel = max(15, band_w // 4)  # ~25% of overlap width
+    v_kernel = 9
+    forbidden = cv2.dilate(
+        forbidden,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (h_kernel, v_kernel)),
+    )
+
+    # Mask out non-overlap pixels AND forbidden zones with high cost.
+    overlap_band = plan.fast_overlap_mask_out[:, xmin:xmax]
+    high = 1 << 24
+    cost = np.where(overlap_band > 0, diff_sum, high).astype(np.int64)
+    cost = np.where(forbidden > 0, np.int64(high), cost)
+
+    # Optional downscale for the DP. cv2.resize keeps the cost shape stable.
+    if downscale > 1:
+        ds_h = max(1, out_h // downscale)
+        ds_w = max(1, cost.shape[1] // downscale)
+        cost_ds = cv2.resize(cost.astype(np.float32),
+                             (ds_w, ds_h),
+                             interpolation=cv2.INTER_AREA).astype(np.int64)
+    else:
+        cost_ds = cost
+        ds_h, ds_w = cost_ds.shape
+
+    # Dynamic program top-down. Each row's cell adds the min of the three
+    # cells above it (left, center, right) plus its own cost. int64 keeps
+    # the accumulator from overflowing when many rows worth of "high cost"
+    # placeholder values stack up.
+    dp = np.empty_like(cost_ds)
+    dp[0] = cost_ds[0]
+    big = np.int64(high) * np.int64(ds_h)
+    for r in range(1, ds_h):
+        prev = dp[r - 1]
+        ls = np.empty_like(prev)
+        ls[0] = big
+        ls[1:] = prev[:-1]
+        rs = np.empty_like(prev)
+        rs[-1] = big
+        rs[:-1] = prev[1:]
+        dp[r] = cost_ds[r] + np.minimum(np.minimum(ls, prev), rs)
+
+    # Backtrace: start at min of last row, walk up choosing min predecessor.
+    seam_ds = np.empty(ds_h, dtype=np.int32)
+    seam_ds[-1] = int(np.argmin(dp[-1]))
+    for r in range(ds_h - 2, -1, -1):
+        c = seam_ds[r + 1]
+        cl = c - 1 if c > 0 else c
+        cr = c + 1 if c < ds_w - 1 else c
+        # Pick the predecessor with the lowest cost.
+        candidates = (dp[r, cl], dp[r, c], dp[r, cr])
+        best = int(np.argmin(candidates))
+        seam_ds[r] = (cl, c, cr)[best]
+
+    # Upscale seam back to output rows and shift to absolute output cols.
+    if downscale > 1:
+        # Map ds_row → out_row by linear interp.
+        out_rows = np.arange(out_h)
+        ds_rows = (out_rows.astype(np.float32) + 0.5) * (ds_h / float(out_h)) - 0.5
+        ds_rows = np.clip(ds_rows, 0, ds_h - 1)
+        ri = ds_rows.astype(np.int32)
+        rf = ds_rows - ri
+        ri_next = np.clip(ri + 1, 0, ds_h - 1)
+        seam_full_band = (
+            seam_ds[ri].astype(np.float32) * (1 - rf)
+            + seam_ds[ri_next].astype(np.float32) * rf
+        )
+        seam_full_band = (seam_full_band * downscale).astype(np.int32)
+    else:
+        seam_full_band = seam_ds.copy()
+
+    # Translate to absolute output column.
+    seam_full = seam_full_band + xmin
+
+    # Clamp each row to its specific overlap range; rows with no overlap
+    # keep the prev seam value (irrelevant, since baseline mask covers them).
+    lo = plan.fast_overlap_row_lo
+    hi = plan.fast_overlap_row_hi
+    has_overlap = lo >= 0
+    seam_clamped = np.where(
+        has_overlap,
+        np.clip(seam_full, np.maximum(lo, 0), np.maximum(hi - 1, 0)),
+        plan.fast_seam_prev,
+    ).astype(np.int32)
+
+    # Temporal smoothing: blend with the previous frame's seam so it doesn't
+    # jitter on small per-frame cost-map noise.
+    alpha = 1.0 - float(plan.fast_seam_smooth)  # alpha = how much new contributes
+    if alpha < 0.999:
+        smoothed = (
+            plan.fast_seam_prev.astype(np.float32) * (1 - alpha)
+            + seam_clamped.astype(np.float32) * alpha
+        ).astype(np.int32)
+    else:
+        smoothed = seam_clamped
+    plan.fast_seam_prev = smoothed
+    return smoothed
+
+
+def build_seam_weights(plan: StitchPlan, seam: np.ndarray,
+                       out_h: int, out_w: int,
+                       crossfade_px: int) -> np.ndarray:
+    """Build a (out_h, out_w) uint8 weight map for the LEFT camera. The
+    right camera's weight is (covered_mask - left_weight)."""
+    col_idx = np.arange(out_w, dtype=np.float32)[None, :]
+    seam_col = seam.astype(np.float32)[:, None]
+    # Distance from seam: negative = left of seam (use left camera).
+    d = col_idx - seam_col
+    if crossfade_px <= 0:
+        # Hard cut: 1 if d < 0, else 0.
+        wl_norm = (d < 0).astype(np.float32)
+    else:
+        wl_norm = np.clip(0.5 - d / (2.0 * float(crossfade_px)), 0.0, 1.0)
+    wl_u8 = (wl_norm * 255.0 + 0.5).astype(np.uint8)
+    # Override outside overlap with the static baseline weight (so left-only
+    # gets 255 left and right-only gets 0).
+    band = plan.fast_overlap_mask_out
+    wl_u8 = np.where(band > 0, wl_u8, plan.fast_baseline_left_u8)
+    # Zero out fully-uncovered pixels.
+    wl_u8 = np.where(plan.fast_covered_mask > 0, wl_u8, 0).astype(np.uint8)
+    return wl_u8
+
+
 def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
-                      out_w: int, out_h: int, frame_idx: int) -> np.ndarray:
-    """Per-frame fast path: two remaps, sampled exposure, vectorized blend."""
+                      out_w: int, out_h: int, frame_idx: int,
+                      seam_mode: str = "dynamic",
+                      seam_crossfade_px: int = 4,
+                      seam_downscale: int = 2) -> np.ndarray:
+    """Per-frame fast path: two remaps, optional seam routing, blend.
+
+    seam_mode = "feather"   - use the static feathered weights from bake
+                              (Codex's original behavior, shows ghosting).
+              = "dynamic"   - per-frame minimum-disagreement seam-cut so
+                              foreground objects (hands) appear in exactly
+                              one camera. Default — fixes parallax ghost.
+              = "static"    - hard cut at the natural distance-transform
+                              seam, no per-frame work but cuts through
+                              foreground if it sits on the seam.
+    """
     warped_left = cv2.remap(
         left, plan.fast_map_left_x, plan.fast_map_left_y,
         interpolation=cv2.INTER_LINEAR,
@@ -661,15 +943,30 @@ def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
             r = cv2.convertScaleAbs(r, alpha=float(gain[2]))
             warped_right = cv2.merge([b, g, r])
 
+    # Pick the weight map based on seam_mode.
+    if seam_mode == "feather" or plan.fast_overlap_xmax <= plan.fast_overlap_xmin:
+        # Original feather-blend behavior, or no overlap → use baked weights.
+        wl_bgr = plan.fast_weight_left_bgr
+        wr_bgr = plan.fast_weight_right_bgr
+    else:
+        if seam_mode == "dynamic":
+            seam = find_dynamic_seam(warped_left, warped_right, plan,
+                                     downscale=max(1, seam_downscale))
+        elif seam_mode == "static":
+            # Use the static midline that bake set as the initial seam.
+            seam = plan.fast_seam_prev
+        else:
+            raise ValueError(f"unknown seam_mode {seam_mode!r}")
+        wl_u8 = build_seam_weights(plan, seam, out_h, out_w,
+                                   crossfade_px=max(0, seam_crossfade_px))
+        wr_u8 = np.where(plan.fast_covered_mask > 0,
+                         255 - wl_u8, 0).astype(np.uint8)
+        wl_bgr = cv2.merge([wl_u8, wl_u8, wl_u8])
+        wr_bgr = cv2.merge([wr_u8, wr_u8, wr_u8])
+
     # Vectorized uint8 blend: each pixel = (src * weight) / 255, summed.
-    # cv2.multiply with scale=1/255 saturates back to uint8 in one SIMD pass,
-    # cv2.add saturates the sum. Both inputs are (H, W, 3) uint8, no broadcast.
-    left_contrib = cv2.multiply(
-        warped_left, plan.fast_weight_left_bgr, scale=1.0 / 255.0,
-    )
-    right_contrib = cv2.multiply(
-        warped_right, plan.fast_weight_right_bgr, scale=1.0 / 255.0,
-    )
+    left_contrib = cv2.multiply(warped_left, wl_bgr, scale=1.0 / 255.0)
+    right_contrib = cv2.multiply(warped_right, wr_bgr, scale=1.0 / 255.0)
     return cv2.add(left_contrib, right_contrib)
 
 
@@ -824,15 +1121,27 @@ def main() -> int:
     use_cuda = env_bool("RCPILOT_STITCH_USE_CUDA", True)
     use_fast = env_bool("RCPILOT_STITCH_FAST", True)
     exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
+    seam_mode = os.getenv("RCPILOT_STITCH_SEAM", "dynamic").strip().lower()
+    if seam_mode not in {"dynamic", "static", "feather"}:
+        raise SystemExit(
+            f"RCPILOT_STITCH_SEAM must be dynamic|static|feather, got "
+            f"{seam_mode!r}"
+        )
+    seam_crossfade_px = env_int("RCPILOT_STITCH_SEAM_CROSSFADE_PX", 4)
+    seam_downscale = max(1, env_int("RCPILOT_STITCH_SEAM_DOWNSCALE", 2))
+    seam_smooth = float(np.clip(
+        env_float("RCPILOT_STITCH_SEAM_SMOOTH", 0.6), 0.0, 0.95))
 
     if left_sensor == right_sensor:
         raise SystemExit("left and right sensor ids must differ")
 
     log.info(
         "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
-        "encoder=%s bitrate=%d fast=%s exposure_every_n=%d -> %s:%d",
+        "encoder=%s bitrate=%d fast=%s seam=%s seam_crossfade=%d "
+        "seam_downscale=%d -> %s:%d",
         left_sensor, right_sensor, width, height, fps, out_width, out_height,
-        encoder, bitrate, use_fast, exposure_every_n, cockpit_ip, port,
+        encoder, bitrate, use_fast, seam_mode, seam_crossfade_px,
+        seam_downscale, cockpit_ip, port,
     )
 
     left_pipeline = build_capture_pipeline(left_sensor, width, height, fps, sensor_mode)
@@ -871,6 +1180,7 @@ def main() -> int:
             log=log,
         )
         plan.fast_exposure_every_n = max(0, exposure_every_n)
+        plan.fast_seam_smooth = seam_smooth
         if use_fast:
             bake_fast_path(plan, width, height, out_width, out_height, log)
         preview_left, _ = left_reader.latest()
@@ -880,6 +1190,9 @@ def main() -> int:
                 preview = stitch_frame_fast(
                     preview_left, preview_right, plan,
                     out_width, out_height, frame_idx=0,
+                    seam_mode=seam_mode,
+                    seam_crossfade_px=seam_crossfade_px,
+                    seam_downscale=seam_downscale,
                 )
             else:
                 preview = stitch_frame(
@@ -915,6 +1228,9 @@ def main() -> int:
                 stitched = stitch_frame_fast(
                     left, right, plan, out_width, out_height,
                     frame_idx=total_frames,
+                    seam_mode=seam_mode,
+                    seam_crossfade_px=seam_crossfade_px,
+                    seam_downscale=seam_downscale,
                 )
             else:
                 stitched = stitch_frame(left, right, plan, out_width, out_height)
