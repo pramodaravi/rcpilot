@@ -1,5 +1,5 @@
 [Unit]
-Description=rcpilot dual-camera stitched video sender (IMX219 x2 -> nvcompositor -> RTP H.264 -> cockpit)
+Description=rcpilot dual-camera real panorama sender (IMX219 x2 -> warped/blended RTP H.264 -> cockpit)
 Documentation=https://github.com/pramodaravi/rcpilot
 After=network-online.target
 Wants=network-online.target

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# rcpilot — Jetson install script.
+# rcpilot - Jetson install script.
 #
 # Idempotent: safe to re-run after pulling new code. Installs:
 #   * GStreamer plugins missing from the minimal JetPack image
@@ -33,6 +33,8 @@ apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
     nano \
+    python3-numpy \
+    python3-opencv \
     python3-venv \
     python3-pip
 
@@ -48,8 +50,17 @@ echo "[install] installing rcpilot in editable mode..."
 "${VENV_DIR}/bin/pip" install -e "${REPO_ROOT}"
 
 # ---- 3. Smoke check ------------------------------------------------------
-echo "[install] sanity check — required GStreamer elements:"
-for element in nvarguscamerasrc nvvidconv x264enc h264parse rtph264pay udpsink; do
+echo "[install] sanity check - required GStreamer elements:"
+for element in \
+    nvarguscamerasrc \
+    nvvidconv \
+    videoconvert \
+    appsrc \
+    appsink \
+    x264enc \
+    h264parse \
+    rtph264pay \
+    udpsink; do
     if gst-inspect-1.0 "${element}" > /dev/null 2>&1; then
         echo "    [ok]   ${element}"
     else
@@ -62,3 +73,4 @@ echo "[install] done."
 echo "  Activate with:    source ${VENV_DIR}/bin/activate"
 echo "  Run echo server:  rcpilot-echo-server -v"
 echo "  Run video sender: RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video.sh"
+echo "  Run AI stitcher:  RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"
