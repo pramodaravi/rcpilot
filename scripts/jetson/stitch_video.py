@@ -273,6 +273,24 @@ class StitchPlan:
     exposure_gain: np.ndarray
     use_cuda: bool
 
+    # ---- fast-path pre-baked tables (built by bake_fast_path) ----------
+    # Once-per-startup remap tables that fuse warp + crop + resize so the
+    # per-frame work is just two cv2.remap calls + one vectorized uint8
+    # blend. Set lazily — None until bake_fast_path() runs.
+    fast_map_left_x: Optional[np.ndarray] = None
+    fast_map_left_y: Optional[np.ndarray] = None
+    fast_map_right_x: Optional[np.ndarray] = None
+    fast_map_right_y: Optional[np.ndarray] = None
+    # Output-resolution 3-channel weights as uint8 [0..255], so cv2.multiply
+    # against a BGR frame is one shape-matched SIMD op (no broadcast).
+    fast_weight_left_bgr: Optional[np.ndarray] = None
+    fast_weight_right_bgr: Optional[np.ndarray] = None
+    # Single-channel uint8 mask of the overlap region at output resolution,
+    # used to sample exposure cheaply without re-warping.
+    fast_overlap_mask_out: Optional[np.ndarray] = None
+    # How often to refresh the exposure gain in fast mode (frames).
+    fast_exposure_every_n: int = 15
+
 
 def find_clean_crop(mask: np.ndarray,
                     min_edge_coverage: float) -> Tuple[int, int, int, int]:
@@ -373,6 +391,29 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
     left_weight[only_right] = 0.0
     right_weight[only_right] = 1.0
 
+    # Optional narrow-feather pass. Distance-transform feathering produces a
+    # very wide blend zone, which makes parallax ghosting visible across the
+    # whole overlap. Setting RCPILOT_STITCH_FEATHER_PX clips the soft band
+    # to that many pixels around the seam (where left_distance == right_distance)
+    # and snaps everything outside the band to the nearer camera.
+    feather_px = env_int("RCPILOT_STITCH_FEATHER_PX", 24)
+    if feather_px > 0:
+        overlap_full = (left_mask > 0) & (right_mask > 0)
+        diff = left_distance - right_distance  # >0 = deeper into left
+        in_band = overlap_full & (np.abs(diff) < float(feather_px))
+        far_overlap = overlap_full & ~in_band
+        # Linear ramp across the band: at diff = -feather_px → all right,
+        # at diff = +feather_px → all left.
+        ramp_left = np.clip(0.5 + diff / (2.0 * float(feather_px)), 0.0, 1.0)
+        left_weight[in_band] = ramp_left[in_band].astype(np.float32)
+        right_weight[in_band] = (1.0 - ramp_left[in_band]).astype(np.float32)
+        snap_left = far_overlap & (diff > 0)
+        snap_right = far_overlap & (diff < 0)
+        left_weight[snap_left] = 1.0
+        right_weight[snap_left] = 0.0
+        left_weight[snap_right] = 0.0
+        right_weight[snap_right] = 1.0
+
     coverage_mask = ((left_mask > 0) | (right_mask > 0)).astype(np.uint8)
     overlap_mask = ((left_mask > 0) & (right_mask > 0)).astype(np.uint8) * 255
     if np.count_nonzero(overlap_mask) > 0:
@@ -400,9 +441,9 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
 
     log.info(
         "stitch canvas=%dx%d crop=(%d,%d %dx%d) left_offset=(%d,%d) "
-        "overlap_pixels=%d exposure_match=%s cuda_warp=%s",
+        "overlap_pixels=%d feather_px=%d exposure_match=%s cuda_warp=%s",
         canvas_w, canvas_h, crop_x, crop_y, crop_w, crop_h, tx, ty,
-        overlap_pixels, exposure_match, cuda_ok,
+        overlap_pixels, feather_px, exposure_match, cuda_ok,
     )
     return StitchPlan(
         h_canvas=h_canvas.astype(np.float64),
@@ -482,6 +523,154 @@ def stitch_frame(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
     if stitched.shape[1] != out_w or stitched.shape[0] != out_h:
         stitched = cv2.resize(stitched, (out_w, out_h), interpolation=cv2.INTER_AREA)
     return stitched
+
+
+def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
+                   out_w: int, out_h: int, log: logging.Logger) -> None:
+    """Pre-compute remap tables and weights at output resolution.
+
+    The slow stitch_frame() does its work on the full canvas (which is larger
+    than the output), then crops and resizes. The fast path collapses warp +
+    crop + resize into two cv2.remap lookups straight from each source camera
+    into the final out_w x out_h frame, and pre-converts the alpha weights to
+    3-channel uint8 so the blend is one cv2.multiply + cv2.add per camera.
+    """
+    # For each output pixel (u, v), figure out which canvas pixel it samples,
+    # then which source pixel that canvas pixel came from.
+    sx_u = (np.arange(out_w, dtype=np.float32) + 0.5) * (plan.crop_w / float(out_w))
+    sy_v = (np.arange(out_h, dtype=np.float32) + 0.5) * (plan.crop_h / float(out_h))
+    canvas_x = (plan.crop_x + sx_u - 0.5).reshape(1, -1)
+    canvas_y = (plan.crop_y + sy_v - 0.5).reshape(-1, 1)
+    cx_full = np.broadcast_to(canvas_x, (out_h, out_w)).astype(np.float32)
+    cy_full = np.broadcast_to(canvas_y, (out_h, out_w)).astype(np.float32)
+
+    # Left camera: canvas was just translated by (left_x, left_y). Don't
+    # pre-filter "out of bounds" — cv2.remap's BORDER_CONSTANT handles real
+    # OOB by sampling 0, and pre-filtering would clobber legitimate edge
+    # samples whose interpolation kernel overlaps the source by 80%+ (e.g.
+    # a coordinate of -0.09 should still pull mostly-real pixel data, the
+    # same way the slow path's resize step does).
+    invalid = -1e6  # only used to neutralize NaN/Inf, never triggered for valid samples
+    left_sx = (cx_full - float(plan.left_x)).astype(np.float32)
+    left_sy = (cy_full - float(plan.left_y)).astype(np.float32)
+
+    # Right camera: invert the canvas homography.
+    h_inv = np.linalg.inv(plan.h_canvas).astype(np.float64)
+    flat_x = cx_full.ravel().astype(np.float64)
+    flat_y = cy_full.ravel().astype(np.float64)
+    homo = np.stack([flat_x, flat_y, np.ones_like(flat_x)], axis=0)  # (3, N)
+    src = h_inv @ homo  # (3, N)
+    # Guard against the homography's line at infinity producing NaN/Inf —
+    # those values would crash or produce garbage in cv2.remap.
+    denom = src[2]
+    safe = np.abs(denom) > 1e-9
+    rsx = np.where(safe, src[0] / np.where(safe, denom, 1.0), invalid).reshape(out_h, out_w)
+    rsy = np.where(safe, src[1] / np.where(safe, denom, 1.0), invalid).reshape(out_h, out_w)
+    rsx = np.where(np.isfinite(rsx), rsx, invalid).astype(np.float32)
+    rsy = np.where(np.isfinite(rsy), rsy, invalid).astype(np.float32)
+
+    # Resample the float32 weights to output resolution and convert to
+    # 3-channel uint8 [0..255] so cv2.multiply lines up channel-for-channel.
+    cropped_lw = plan.left_weight[
+        plan.crop_y:plan.crop_y + plan.crop_h,
+        plan.crop_x:plan.crop_x + plan.crop_w,
+    ]
+    cropped_rw = plan.right_weight[
+        plan.crop_y:plan.crop_y + plan.crop_h,
+        plan.crop_x:plan.crop_x + plan.crop_w,
+    ]
+    interp = cv2.INTER_AREA if plan.crop_w > out_w else cv2.INTER_LINEAR
+    lw_out = cv2.resize(cropped_lw, (out_w, out_h), interpolation=interp)
+    rw_out = cv2.resize(cropped_rw, (out_w, out_h), interpolation=interp)
+    # Renormalize so the pair sums to 1 wherever covered.
+    total = lw_out + rw_out
+    valid = total > 1e-6
+    lw_norm = np.zeros_like(lw_out)
+    rw_norm = np.zeros_like(rw_out)
+    lw_norm[valid] = lw_out[valid] / total[valid]
+    rw_norm[valid] = rw_out[valid] / total[valid]
+    lw_u8 = np.clip(lw_norm * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    rw_u8 = np.clip(rw_norm * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    plan.fast_weight_left_bgr = cv2.merge([lw_u8, lw_u8, lw_u8])
+    plan.fast_weight_right_bgr = cv2.merge([rw_u8, rw_u8, rw_u8])
+
+    # Cheap exposure sampling mask: pixels where both contribute meaningfully.
+    overlap_out = ((lw_u8 > 32) & (rw_u8 > 32)).astype(np.uint8) * 255
+    plan.fast_overlap_mask_out = overlap_out
+
+    plan.fast_map_left_x = left_sx
+    plan.fast_map_left_y = left_sy
+    plan.fast_map_right_x = rsx
+    plan.fast_map_right_y = rsy
+
+    log.info(
+        "fast-path baked: out=%dx%d remap_tables=2 overlap_out_pixels=%d "
+        "exposure_every_n=%d",
+        out_w, out_h, int((overlap_out > 0).sum()), plan.fast_exposure_every_n,
+    )
+
+
+def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
+                      out_w: int, out_h: int, frame_idx: int) -> np.ndarray:
+    """Per-frame fast path: two remaps, sampled exposure, vectorized blend."""
+    warped_left = cv2.remap(
+        left, plan.fast_map_left_x, plan.fast_map_left_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    warped_right = cv2.remap(
+        right, plan.fast_map_right_x, plan.fast_map_right_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+
+    # Sampled exposure refresh: only every N frames, and on the small overlap
+    # region rather than the full canvas. Skip the work in between.
+    if (
+        plan.exposure_match
+        and plan.fast_overlap_mask_out is not None
+        and plan.fast_exposure_every_n > 0
+        and (frame_idx % plan.fast_exposure_every_n) == 0
+        and int(np.count_nonzero(plan.fast_overlap_mask_out)) > 5000
+    ):
+        left_mean = np.array(
+            cv2.mean(warped_left, mask=plan.fast_overlap_mask_out)[:3],
+            dtype=np.float32,
+        )
+        right_mean = np.array(
+            cv2.mean(warped_right, mask=plan.fast_overlap_mask_out)[:3],
+            dtype=np.float32,
+        )
+        if float(right_mean.max()) > 2.0 and float(left_mean.max()) > 2.0:
+            target_gain = np.clip(
+                left_mean / np.maximum(right_mean, 1.0), 0.70, 1.45,
+            )
+            plan.exposure_gain = (
+                plan.exposure_gain * (1.0 - plan.exposure_alpha)
+                + target_gain * plan.exposure_alpha
+            ).astype(np.float32)
+
+    if plan.exposure_match:
+        gain = plan.exposure_gain
+        if not (0.99 <= float(gain.min()) and float(gain.max()) <= 1.01):
+            # Per-channel gain via split / convertScaleAbs / merge — keeps
+            # everything in uint8 land so we never allocate a float canvas.
+            b, g, r = cv2.split(warped_right)
+            b = cv2.convertScaleAbs(b, alpha=float(gain[0]))
+            g = cv2.convertScaleAbs(g, alpha=float(gain[1]))
+            r = cv2.convertScaleAbs(r, alpha=float(gain[2]))
+            warped_right = cv2.merge([b, g, r])
+
+    # Vectorized uint8 blend: each pixel = (src * weight) / 255, summed.
+    # cv2.multiply with scale=1/255 saturates back to uint8 in one SIMD pass,
+    # cv2.add saturates the sum. Both inputs are (H, W, 3) uint8, no broadcast.
+    left_contrib = cv2.multiply(
+        warped_left, plan.fast_weight_left_bgr, scale=1.0 / 255.0,
+    )
+    right_contrib = cv2.multiply(
+        warped_right, plan.fast_weight_right_bgr, scale=1.0 / 255.0,
+    )
+    return cv2.add(left_contrib, right_contrib)
 
 
 def calibration_path() -> Path:
@@ -633,15 +822,17 @@ def main() -> int:
     key_interval = env_int("RCPILOT_KEY_INTERVAL", max(1, fps // 2))
     x264_preset = os.getenv("RCPILOT_X264_PRESET", "superfast")
     use_cuda = env_bool("RCPILOT_STITCH_USE_CUDA", True)
+    use_fast = env_bool("RCPILOT_STITCH_FAST", True)
+    exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
 
     if left_sensor == right_sensor:
         raise SystemExit("left and right sensor ids must differ")
 
     log.info(
         "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
-        "encoder=%s bitrate=%d -> %s:%d",
+        "encoder=%s bitrate=%d fast=%s exposure_every_n=%d -> %s:%d",
         left_sensor, right_sensor, width, height, fps, out_width, out_height,
-        encoder, bitrate, cockpit_ip, port,
+        encoder, bitrate, use_fast, exposure_every_n, cockpit_ip, port,
     )
 
     left_pipeline = build_capture_pipeline(left_sensor, width, height, fps, sensor_mode)
@@ -679,10 +870,21 @@ def main() -> int:
             use_cuda=use_cuda,
             log=log,
         )
+        plan.fast_exposure_every_n = max(0, exposure_every_n)
+        if use_fast:
+            bake_fast_path(plan, width, height, out_width, out_height, log)
         preview_left, _ = left_reader.latest()
         preview_right, _ = right_reader.latest()
         if preview_left is not None and preview_right is not None:
-            preview = stitch_frame(preview_left, preview_right, plan, out_width, out_height)
+            if use_fast:
+                preview = stitch_frame_fast(
+                    preview_left, preview_right, plan,
+                    out_width, out_height, frame_idx=0,
+                )
+            else:
+                preview = stitch_frame(
+                    preview_left, preview_right, plan, out_width, out_height,
+                )
             save_debug_image("stitched_preview.jpg", preview, log)
 
         writer = cv2.VideoWriter(
@@ -694,6 +896,7 @@ def main() -> int:
         log.info("RTP writer open")
 
         frame_count = 0
+        total_frames = 0
         last_log = time.monotonic()
         period = 1.0 / max(1, fps)
         next_frame = time.monotonic()
@@ -708,9 +911,16 @@ def main() -> int:
             right, right_count = right_reader.latest()
             if left is None or right is None:
                 continue
-            stitched = stitch_frame(left, right, plan, out_width, out_height)
+            if use_fast:
+                stitched = stitch_frame_fast(
+                    left, right, plan, out_width, out_height,
+                    frame_idx=total_frames,
+                )
+            else:
+                stitched = stitch_frame(left, right, plan, out_width, out_height)
             writer.write(stitched)
             frame_count += 1
+            total_frames += 1
 
             now = time.monotonic()
             if now - last_log >= 2.0:
