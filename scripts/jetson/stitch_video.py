@@ -132,7 +132,9 @@ class CameraReader:
     def stop(self) -> None:
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                self.log.warning("%s camera thread did not stop cleanly", self.label)
 
     def latest(self) -> Tuple[Optional[np.ndarray], int]:
         with self._lock:
@@ -140,15 +142,15 @@ class CameraReader:
                 return None, self._count
             return self._latest.copy(), self._count
 
-    def wait_frame(self, timeout_s: float) -> Optional[np.ndarray]:
+    def wait_frame(self, timeout_s: float,
+                   after_count: int = -1) -> Tuple[Optional[np.ndarray], int]:
         deadline = time.monotonic() + timeout_s
-        last_count = -1
         while time.monotonic() < deadline:
             frame, count = self.latest()
-            if frame is not None and count != last_count:
-                return frame
+            if frame is not None and count != after_count:
+                return frame, count
             time.sleep(0.01)
-        return None
+        return None, after_count
 
     def _loop(self) -> None:
         while self._running.is_set():
@@ -194,13 +196,21 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
                              interpolation=cv2.INTER_AREA)
     left_gray = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
     right_gray = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    left_gray = clahe.apply(left_gray)
+    right_gray = clahe.apply(right_gray)
 
     detector_name = "ORB"
     if hasattr(cv2, "SIFT_create"):
-        detector = cv2.SIFT_create(nfeatures=2500)
+        try:
+            detector = cv2.SIFT_create(
+                nfeatures=5000, contrastThreshold=0.015, edgeThreshold=18,
+            )
+        except (TypeError, cv2.error):
+            detector = cv2.SIFT_create(nfeatures=5000)
         detector_name = "SIFT"
     else:
-        detector = cv2.ORB_create(nfeatures=3000, fastThreshold=12)
+        detector = cv2.ORB_create(nfeatures=5000, fastThreshold=8)
 
     kp_l, des_l = detector.detectAndCompute(left_gray, None)
     kp_r, des_r = detector.detectAndCompute(right_gray, None)
@@ -215,11 +225,12 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
 
     raw = matcher.knnMatch(des_r, des_l, k=2)
     good = []
+    ratio = float(np.clip(env_float("RCPILOT_STITCH_MATCH_RATIO", 0.82), 0.60, 0.95))
     for pair in raw:
         if len(pair) != 2:
             continue
         m, n = pair
-        if m.distance < 0.74 * n.distance:
+        if m.distance < ratio * n.distance:
             good.append(m)
 
     if len(good) < min_matches:
@@ -236,8 +247,9 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
         return None
 
     inliers = int(mask.ravel().sum())
-    if inliers < min_matches:
-        log.warning("not enough stitch inliers: %d < %d", inliers, min_matches)
+    min_inliers = env_int("RCPILOT_STITCH_MIN_INLIERS", max(6, min_matches - 2))
+    if inliers < min_inliers:
+        log.warning("not enough stitch inliers: %d < %d", inliers, min_inliers)
         return None
 
     s = np.array([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]])
@@ -742,17 +754,27 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
     if cached is not None:
         return cached
 
-    samples = env_int("RCPILOT_STITCH_CALIBRATION_SAMPLES", 8)
-    min_matches = env_int("RCPILOT_STITCH_MIN_MATCHES", 18)
-    feature_scale = env_float("RCPILOT_STITCH_FEATURE_SCALE", 0.50)
+    samples = env_int("RCPILOT_STITCH_CALIBRATION_SAMPLES", 20)
+    min_matches = env_int("RCPILOT_STITCH_MIN_MATCHES", 10)
+    feature_scale = env_float("RCPILOT_STITCH_FEATURE_SCALE", 0.75)
     best: Optional[HomographyResult] = None
     last_left: Optional[np.ndarray] = None
     last_right: Optional[np.ndarray] = None
+    last_left_count = -1
+    last_right_count = -1
 
-    log.info("estimating stitch alignment from %d frame pairs", samples)
+    log.info(
+        "estimating stitch alignment from %d fresh frame pairs "
+        "(min_matches=%d feature_scale=%.2f)",
+        samples, min_matches, feature_scale,
+    )
     for idx in range(samples):
-        left = left_reader.wait_frame(timeout_s=3.0)
-        right = right_reader.wait_frame(timeout_s=3.0)
+        left, last_left_count = left_reader.wait_frame(
+            timeout_s=3.0, after_count=last_left_count,
+        )
+        right, last_right_count = right_reader.wait_frame(
+            timeout_s=3.0, after_count=last_right_count,
+        )
         if left is None or right is None:
             log.warning("calibration sample %d: no frame yet", idx + 1)
             continue
@@ -771,7 +793,6 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
         time.sleep(0.12)
 
     if best is not None:
-        save_calibration(path, width, height, best, log)
         return best
 
     if last_left is not None:
@@ -870,6 +891,8 @@ def main() -> int:
             use_cuda=use_cuda,
             log=log,
         )
+        if h_result.detector not in {"cached", "fallback"}:
+            save_calibration(calibration_path(), width, height, h_result, log)
         plan.fast_exposure_every_n = max(0, exposure_every_n)
         if use_fast:
             bake_fast_path(plan, width, height, out_width, out_height, log)
