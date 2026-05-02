@@ -12,8 +12,18 @@
 #   - The cockpit just sees one wide video and renders it on one Quad — no
 #     custom shader, no UV math, no duplicated middle from parallel-mounted
 #     cameras
-#   - nvcompositor is Tegra-hardware-accelerated, so the per-frame composite
-#     cost is essentially free on the GPU
+#
+# Why CPU `compositor` instead of GPU `nvcompositor`:
+#   - On Orin Nano + JetPack 6 the NvVIC hardware compositor errors out with
+#     "failed to validate surface, surface too small" / "dst surface invalid"
+#     when fed two 720p sinks placed side-by-side. Forcing explicit output
+#     caps doesn't help — nvcompositor's output negotiation rejects them.
+#   - The CPU compositor is a software fallback that works universally. We
+#     pull each camera out of NVMM via nvvidconv first (a single zero-copy-ish
+#     hop into system memory), then compose in I420. Total CPU cost on the
+#     Orin Nano: ~10-15% across one core for 2x 720p @ 30 fps — fine.
+#   - Switch back to nvcompositor only if a future L4T release fixes the
+#     surface-validation bug, or if encode CPU starts pegging.
 #
 # Trade-off: total pixel count doubles (1280x720 -> 2560x720), so the encoder
 # has more work to do. We compensate by dropping framerate to 30 fps and
@@ -61,21 +71,20 @@ cat <<INFO >&2
 ====================================================
 INFO
 
-# nvcompositor pipeline:
-#   - Two nvarguscamerasrc sources, both at ${WIDTH}x${HEIGHT}@${FPS}, NVMM.
-#   - nvcompositor stitches them side-by-side into a ${OUT_W}x${OUT_H} NV12
-#     frame, still in NVMM (no host-memory copy).
-#   - Single nvvidconv pulls the merged frame out of NVMM into I420 system
-#     memory for the software encoder.
+# Pipeline:
+#   - Two nvarguscamerasrc sources, both at ${WIDTH}x${HEIGHT}@${FPS} in NVMM.
+#   - Each camera's output runs through nvvidconv to land in system memory
+#     as I420 (single zero-copy-ish hop out of NVMM, compositor needs CPU
+#     access to the buffers).
+#   - compositor (CPU) places sink_0 at x=0 and sink_1 at x=${WIDTH},
+#     producing one ${OUT_W}x${OUT_H} I420 frame.
 #   - x264 (zerolatency, intra-refresh) encodes the merged frame.
 #   - rtph264pay -> udpsink to cockpit.
 exec gst-launch-1.0 -v \
-    nvcompositor name=comp \
-        sink_0::xpos=0          sink_0::ypos=0 \
-        sink_0::width=${WIDTH}  sink_0::height=${HEIGHT} \
-        sink_1::xpos=${WIDTH}   sink_1::ypos=0 \
-        sink_1::width=${WIDTH}  sink_1::height=${HEIGHT} \
-    comp. ! nvvidconv ! video/x-raw,format=I420 \
+    compositor name=comp background=black \
+        sink_0::xpos=0        sink_0::ypos=0 \
+        sink_1::xpos=${WIDTH} sink_1::ypos=0 \
+    comp. ! videoconvert ! "video/x-raw,format=I420,width=${OUT_W},height=${OUT_H},framerate=${FPS}/1" \
     ! x264enc tune=zerolatency speed-preset=${X264_PRESET} \
         bitrate=${BITRATE_KBPS} key-int-max=${KEY_INTERVAL} bframes=0 \
         intra-refresh=true sliced-threads=true threads=4 byte-stream=true \
@@ -86,8 +95,10 @@ exec gst-launch-1.0 -v \
     nvarguscamerasrc sensor-id=0 sensor-mode="${SENSOR_MODE}" \
         exposuretimerange="100000 10000000" aelock=false \
     ! "video/x-raw(memory:NVMM),width=${WIDTH},height=${HEIGHT},framerate=${FPS}/1,format=NV12" \
+    ! nvvidconv ! "video/x-raw,format=I420" \
     ! comp.sink_0 \
     nvarguscamerasrc sensor-id=1 sensor-mode="${SENSOR_MODE}" \
         exposuretimerange="100000 10000000" aelock=false \
     ! "video/x-raw(memory:NVMM),width=${WIDTH},height=${HEIGHT},framerate=${FPS}/1,format=NV12" \
+    ! nvvidconv ! "video/x-raw,format=I420" \
     ! comp.sink_1
