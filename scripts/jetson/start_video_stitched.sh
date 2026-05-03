@@ -14,7 +14,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ -z "${RCPILOT_COCKPIT_IP:-}" ]]; then
+if [[ -z "${RCPILOT_COCKPIT_IP:-}" \
+      && "${RCPILOT_STITCH_DIAGNOSTIC:-0}" != "1" \
+      && "${RCPILOT_STITCH_PREVIEW_ONLY:-0}" != "1" ]]; then
     echo "ERROR: RCPILOT_COCKPIT_IP not set." >&2
     echo "Example: RCPILOT_COCKPIT_IP=192.168.1.247 $0" >&2
     exit 64
