@@ -60,11 +60,12 @@ def main():
         H, SRC_W, SRC_H,
         max_canvas_w=SRC_W * 4,
         max_canvas_h=SRC_H * 3,
+        output_aspect=float(OUT_W) / float(OUT_H),
         use_cuda=False,  # will be set by bake_fast_path based on env
         log=log,
     )
     accel = os.getenv("RCPILOT_STITCH_ACCEL", "auto").strip().lower()
-    sv.bake_fast_path(plan, SRC_W, SRC_H, OUT_W, OUT_H, log, accel=accel)
+    sv.bake_fast_path(plan, SRC_W, SRC_H, OUT_W, OUT_H, accel, log)
     print(f"plan.fast_accel = {plan.fast_accel}")
     print()
 

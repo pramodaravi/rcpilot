@@ -48,8 +48,8 @@ def main():
                  "Backend", "Stream"):
         if hasattr(vpi, kind):
             obj = getattr(vpi, kind)
-            members = [m for m in dir(obj) if not m.startswith("_")][:30]
-            log(f"vpi.{kind}: {members}")
+            members = [m for m in dir(obj) if not m.startswith("_")]
+            log(f"vpi.{kind}: ({len(members)}) {members}")
     log("")
 
     log("=== Operations of interest ===")
@@ -98,47 +98,28 @@ def main():
     # Pattern A: vpi.asimage(numpy)
     try:
         src_img = vpi.asimage(src_np)
-        log(f"vpi.asimage OK, size={src_img.size}, format={src_img.format}")
+        src_format = src_img.format
+        log(f"vpi.asimage OK, size={src_img.size}, format={src_format}")
+        log(f"  -> output image must use SAME format ({src_format})")
     except Exception as e:
         log(f"vpi.asimage failed: {e}")
         return
 
-    # Try output image creation
-    out_img = None
-    formats_to_try = []
-    if hasattr(vpi, "Format"):
-        for fname in ("BGR8", "RGB8", "U8", "BGRA8", "RGBA8"):
-            f = getattr(vpi.Format, fname, None)
-            if f is not None:
-                formats_to_try.append((fname, f))
-    log(f"available Format attrs to try: {[n for n, _ in formats_to_try]}")
-
-    for fname, fmt in formats_to_try:
-        try:
-            test = vpi.Image((OUT_W, OUT_H), fmt)
-            log(f"  vpi.Image((W, H), {fname}) OK: {test.size}")
-            if fname == "BGR8":
-                out_img = test
-        except Exception as e:
-            log(f"  vpi.Image((W, H), {fname}): {type(e).__name__}: {e}")
+    # Pre-allocate output image with the SAME format as source.
+    out_img = vpi.Image((OUT_W, OUT_H), src_format)
+    log(f"out_img created: size={out_img.size}, format={out_img.format}")
     log("")
 
     log("=== remap API patterns ===")
-    # Try several invocation styles to see which works.
-    if out_img is None:
-        out_img = vpi.Image((OUT_W, OUT_H), vpi.Format.BGR8)
-
     patterns = [
-        ("src.remap(warp_l)",
-         lambda: src_img.remap(warp_l)),
-        ("src.remap(warp_l, interp=LINEAR)",
-         lambda: src_img.remap(warp_l, interp=vpi.Interp.LINEAR)),
-        ("vpi.remap(src, warp_l)",
-         lambda: vpi.remap(src_img, warp_l) if hasattr(vpi, "remap") else (_ for _ in ()).throw(AttributeError("vpi.remap missing"))),
-        ("src.remap(warp_l, interp=LINEAR, out=out_img)",
+        ("src.remap(warp_l, interp=LINEAR, out=out_img)  [matched format]",
          lambda: src_img.remap(warp_l, interp=vpi.Interp.LINEAR, out=out_img)),
         ("src.remap(warp_l, out=out_img)",
          lambda: src_img.remap(warp_l, out=out_img)),
+        ("vpi.dynamic_remap(src, warp_l, out=out_img)",
+         lambda: vpi.dynamic_remap(src_img, warp_l, out=out_img)
+         if hasattr(vpi, "dynamic_remap") else
+         (_ for _ in ()).throw(AttributeError("vpi.dynamic_remap missing"))),
     ]
     working_remap = None
     for name, fn in patterns:
@@ -151,6 +132,16 @@ def main():
         except Exception as e:
             log(f"  FAIL: {name}  -> {type(e).__name__}: {e}")
     log("")
+
+    if hasattr(vpi, "dynamic_remap"):
+        try:
+            doc = vpi.dynamic_remap.__doc__ or "(no doc)"
+            log(f"vpi.dynamic_remap docstring (first 30 lines):")
+            for line in doc.split("\n")[:30]:
+                log(f"    {line}")
+            log("")
+        except Exception:
+            pass
 
     if working_remap is None:
         log("No remap pattern worked — cannot benchmark. Bailing.")
@@ -185,105 +176,88 @@ def main():
     log(f"  remap + sync (out.cpu()):     {t_remap_sync:.2f} ms/frame")
     log("")
 
-    log("=== blend op discovery ===")
-    # We need: out = warped_left * weight_left + warped_right * weight_right
-    # weights are uint8 single-channel, values 0..255 representing 0.0..1.0
-    weight_np = np.full((OUT_H, OUT_W), 128, dtype=np.uint8)
-    try:
-        weight_img = vpi.asimage(weight_np)
-        log(f"weight image: size={weight_img.size}, format={weight_img.format}")
-    except Exception as e:
-        log(f"weight asimage failed: {e}")
-
-    # See if vpi.composite or similar is available
-    blend_candidates = [
-        "composite", "Composite",
-        "image_blend", "imageBlend", "blend",
-        "image_mul", "imageMul",
-        "image_add", "imageAdd",
-    ]
-    for name in blend_candidates:
-        if hasattr(vpi, name):
-            try:
-                doc = getattr(vpi, name).__doc__
-                first_line = doc.split("\n")[0] if doc else "(no doc)"
-                log(f"  vpi.{name}: {first_line}")
-            except Exception as e:
-                log(f"  vpi.{name}: present but introspection failed: {e}")
+    log("=== Image method full enumeration (looking for blend/arith/composite) ===")
+    img_methods = sorted(m for m in dir(vpi.Image) if not m.startswith("_"))
+    log(f"  vpi.Image has {len(img_methods)} public methods/attrs:")
+    for chunk in [img_methods[i:i+8] for i in range(0, len(img_methods), 8)]:
+        log("    " + ", ".join(chunk))
     log("")
 
-    # Try a per-pixel weighted blend using whatever ops exist.
-    # First: if vpi.composite(fg, bg, mask) exists, that's our answer.
-    log("=== per-pixel weighted blend pattern test ===")
-    fg = vpi.asimage(np.random.randint(0, 256, (OUT_H, OUT_W, 3), dtype=np.uint8))
-    bg = vpi.asimage(np.random.randint(0, 256, (OUT_H, OUT_W, 3), dtype=np.uint8))
-    mask = vpi.asimage(weight_np)
-    blend_patterns = [
-        ("vpi.composite(fg, bg, mask)",
-         lambda: vpi.composite(fg, bg, mask)),
-        ("vpi.image_blend(fg, bg, 0.5)",
-         lambda: vpi.image_blend(fg, bg, 0.5) if hasattr(vpi, "image_blend") else None),
-    ]
-    for name, fn in blend_patterns:
-        try:
-            with vpi.Backend.CUDA:
-                r = fn()
-            log(f"  OK: {name}")
-        except Exception as e:
-            log(f"  FAIL: {name} -> {type(e).__name__}: {e}")
+    log("=== top-level vpi op enumeration (full, not just 'interesting') ===")
+    callable_top = sorted(name for name in dir(vpi)
+                          if callable(getattr(vpi, name, None))
+                          and not name.startswith("_")
+                          and name[0].islower())  # lowercase = function
+    log(f"  callable lowercase top-levels ({len(callable_top)}):")
+    for chunk in [callable_top[i:i+5] for i in range(0, len(callable_top), 5)]:
+        log("    " + ", ".join(chunk))
     log("")
 
-    log("=== full-pipeline benchmark (remap x2 + blend) ===")
-    # Two warps then blend. Use whichever blend op worked, else fall back to
-    # numpy on the CPU side after VPI download.
-    src_l = vpi.asimage(src_np)
-    src_r = vpi.asimage(src_np)
-    warped_l = vpi.Image((OUT_W, OUT_H), vpi.Format.BGR8)
-    warped_r = vpi.Image((OUT_W, OUT_H), vpi.Format.BGR8)
-    weight_l_np = np.full((OUT_H, OUT_W), 128, dtype=np.uint8)
+    # See if any ops at all do per-pixel arithmetic or blend
+    arith_candidates = [n for n in callable_top + img_methods
+                        if any(k in n.lower() for k in
+                               ("blend", "compos", "mul", "add", "weight",
+                                "alpha", "convex"))]
+    log(f"=== plausible arithmetic/blend ops: {arith_candidates}")
+    log("")
+
+    log("=== full proposed pipeline benchmark (VPI remap x2 + CPU blend) ===")
+    # Realistic per-frame: TWO source uploads, TWO remaps on CUDA, two
+    # downloads, then a CPU blend (since VPI 3.2.4 lacks per-pixel blend).
+    src_l_np = np.random.randint(0, 256, (SRC_H, SRC_W, 3), dtype=np.uint8)
+    src_r_np = np.random.randint(0, 256, (SRC_H, SRC_W, 3), dtype=np.uint8)
+    warped_l = vpi.Image((OUT_W, OUT_H), src_format)
+    warped_r = vpi.Image((OUT_W, OUT_H), src_format)
+    weight_l_np = np.full((OUT_H, OUT_W, 3), 128, dtype=np.uint8)
     weight_r_np = 255 - weight_l_np
-    weight_l = vpi.asimage(weight_l_np)
-    weight_r = vpi.asimage(weight_r_np)
-
-    # Warmup with whatever pattern works
-    composite_works = hasattr(vpi, "composite")
+    import cv2
 
     def full_pipeline():
+        sl = vpi.asimage(src_l_np)
+        sr = vpi.asimage(src_r_np)
         with vpi.Backend.CUDA:
-            wl = src_l.remap(warp_l, interp=vpi.Interp.LINEAR)
-            wr = src_r.remap(warp_r, interp=vpi.Interp.LINEAR)
-            if composite_works:
-                try:
-                    out = vpi.composite(wl, wr, weight_l)
-                except Exception:
-                    out = wl
-            else:
-                out = wl
-        # Force sync
-        out.cpu()
+            sl.remap(warp_l, interp=vpi.Interp.LINEAR, out=warped_l)
+            sr.remap(warp_r, interp=vpi.Interp.LINEAR, out=warped_r)
+        # download to numpy and blend
+        with warped_l.lock_cpu() as ll, warped_r.lock_cpu() as rr:
+            l_arr = np.asarray(ll)
+            r_arr = np.asarray(rr)
+            cv2.add(
+                cv2.multiply(l_arr, weight_l_np, scale=1.0/255.0),
+                cv2.multiply(r_arr, weight_r_np, scale=1.0/255.0),
+            )
 
-    for _ in range(3):
-        full_pipeline()
-    t0 = time.perf_counter()
-    for _ in range(n):
-        full_pipeline()
-    t_full = (time.perf_counter() - t0) / n * 1000
-    log(f"  full pipeline (remap x2 + blend) round trip: {t_full:.2f} ms/frame")
-    log(f"  budget at 30fps: 33.33 ms/frame   (less encode budget ~12-15 ms)")
+    try:
+        for _ in range(3):
+            full_pipeline()
+        t0 = time.perf_counter()
+        for _ in range(n):
+            full_pipeline()
+        t_full = (time.perf_counter() - t0) / n * 1000
+        log(f"  full pipeline (VPI remap x2 + CPU blend): {t_full:.2f} ms/frame")
+        log(f"  budget at 30fps: 33.33 ms/frame  (less encode budget ~12-15 ms)")
+    except Exception as e:
+        log(f"  pipeline benchmark failed: {type(e).__name__}: {e}")
+        import traceback; traceback.print_exc(file=sys.stdout)
     log("")
 
-    log("=== upload / download cost on this hardware ===")
+    log("=== isolated upload / download cost ===")
     fresh_src = np.random.randint(0, 256, (SRC_H, SRC_W, 3), dtype=np.uint8)
     n_io = 50
     t0 = time.perf_counter()
     for _ in range(n_io):
         s = vpi.asimage(fresh_src)
-    log(f"  vpi.asimage from numpy:  {(time.perf_counter()-t0)/n_io*1000:.2f} ms/call")
+    log(f"  vpi.asimage from numpy:           {(time.perf_counter()-t0)/n_io*1000:.2f} ms/call")
 
-    t0 = time.perf_counter()
-    for _ in range(n_io):
-        np.asarray(warped_l.cpu())
-    log(f"  vpi -> numpy (cpu()):    {(time.perf_counter()-t0)/n_io*1000:.2f} ms/call")
+    # Warm warped_l first
+    if working_remap is not None:
+        with vpi.Backend.CUDA:
+            working_remap[1]()
+        t0 = time.perf_counter()
+        for _ in range(n_io):
+            with warped_l.lock_cpu() as l_view:
+                _ = np.asarray(l_view)
+        log(f"  warped vpi -> numpy view:         {(time.perf_counter()-t0)/n_io*1000:.2f} ms/call")
     log("")
 
     log("DONE.")
