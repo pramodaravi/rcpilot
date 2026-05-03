@@ -468,6 +468,22 @@ class StitchPlan:
     # How often to refresh the exposure gain in fast mode (frames).
     fast_exposure_every_n: int = 15
 
+    # ---- foreground-snap parallax handling (RCPILOT_STITCH_FG_SNAP) -----
+    # Where the two warped cameras meaningfully disagree (foreground objects
+    # like a hand reaching forward — homography only aligns one depth plane,
+    # so closer objects appear at different output positions in each camera),
+    # snap that pixel to ONE camera instead of feather-blending both. That
+    # makes the hand visible once instead of as a ghosted double image.
+    fast_fg_snap: bool = True
+    fast_fg_threshold: int = 30        # pixel-diff threshold to call FG
+    fast_fg_dilate_px: int = 12        # FG mask dilation radius
+    fast_fg_update_every_n: int = 5    # mask refresh cadence (frames)
+    # Pristine baked weights, never modified per frame. The runtime weights
+    # (fast_weight_left_bgr / fast_weight_right_bgr) start as a copy of
+    # these and get overridden in the FG region every fg_update_every_n.
+    fast_weight_left_baked: Optional[np.ndarray] = None
+    fast_weight_right_baked: Optional[np.ndarray] = None
+
 
 def find_clean_crop(mask: np.ndarray,
                     min_edge_coverage: float) -> Tuple[int, int, int, int]:
@@ -798,6 +814,10 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     rw_u8 = np.clip(rw_norm * 255.0 + 0.5, 0, 255).astype(np.uint8)
     plan.fast_weight_left_bgr = cv2.merge([lw_u8, lw_u8, lw_u8])
     plan.fast_weight_right_bgr = cv2.merge([rw_u8, rw_u8, rw_u8])
+    # Pristine copies — the foreground-snap pass overwrites the runtime
+    # weights every N frames using these as the "background blend" baseline.
+    plan.fast_weight_left_baked = plan.fast_weight_left_bgr.copy()
+    plan.fast_weight_right_baked = plan.fast_weight_right_bgr.copy()
 
     # Cheap exposure sampling mask: pixels where both contribute meaningfully.
     overlap_out = ((lw_u8 > 32) & (rw_u8 > 32)).astype(np.uint8) * 255
@@ -854,6 +874,63 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     )
 
 
+def update_foreground_snap(warped_left: np.ndarray, warped_right: np.ndarray,
+                           plan: StitchPlan, frame_idx: int) -> None:
+    """Refresh the runtime weight maps so foreground (parallax-affected)
+    pixels in the overlap snap to a single camera instead of being blended.
+
+    The principle: where the two warped cameras AGREE on a pixel, the
+    homography is doing its job — that pixel is on the dominant depth
+    plane and feather-blending looks fine. Where they DISAGREE, that's
+    parallax: a near-camera object that the homography couldn't align.
+    Hard-cutting those pixels to one camera makes the object visible
+    once instead of as a 50% ghost.
+
+    Cost: ~10ms when it runs, only every fast_fg_update_every_n frames
+    (default 5 → ~6Hz refresh), so amortized ~2ms/frame at 30fps.
+    """
+    if not plan.fast_fg_snap:
+        return
+    if plan.fast_weight_left_baked is None or plan.fast_weight_right_baked is None:
+        return
+    if plan.fast_overlap_mask_out is None:
+        return
+    if plan.fast_fg_update_every_n <= 0:
+        return
+    if (frame_idx % plan.fast_fg_update_every_n) != 0:
+        return
+
+    # Where do the two cameras disagree? Use channel-max so any single
+    # channel difference triggers FG (catches the peach skin tone of a
+    # hand on a grey/black background even if other channels match).
+    diff = cv2.absdiff(warped_left, warped_right)
+    diff_max = diff.max(axis=2)
+
+    # Threshold + dilate. Dilation expands the FG region so the SNAP zone
+    # covers the whole foreground object, not just the boundary edges
+    # where pixel values differ. Without dilation the snap line can run
+    # right through the middle of a hand (low-disagreement interior).
+    fg = (diff_max > plan.fast_fg_threshold).astype(np.uint8) * 255
+    if plan.fast_fg_dilate_px > 0:
+        k = plan.fast_fg_dilate_px
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k * 2 + 1, k * 2 + 1))
+        fg = cv2.dilate(fg, kernel)
+    # Restrict to the overlap region — outside the overlap, only one camera
+    # has data so there's no parallax decision to make.
+    fg = cv2.bitwise_and(fg, plan.fast_overlap_mask_out)
+
+    # In FG pixels: snap to LEFT camera (weight_left = 255, weight_right = 0).
+    # Elsewhere: keep the baked feather weights. np.where broadcasts the
+    # 2D mask to the (H, W, 3) weight arrays automatically.
+    fg_3 = fg[..., None]  # (H, W, 1) for broadcasting
+    plan.fast_weight_left_bgr = np.where(
+        fg_3 > 0, np.uint8(255), plan.fast_weight_left_baked,
+    ).astype(np.uint8)
+    plan.fast_weight_right_bgr = np.where(
+        fg_3 > 0, np.uint8(0), plan.fast_weight_right_baked,
+    ).astype(np.uint8)
+
+
 def finish_fast_frame(warped_left: np.ndarray, warped_right: np.ndarray,
                       plan: StitchPlan, frame_idx: int) -> np.ndarray:
     # Sampled exposure refresh: only every N frames, and on the small overlap
@@ -892,6 +969,11 @@ def finish_fast_frame(warped_left: np.ndarray, warped_right: np.ndarray,
             g = cv2.convertScaleAbs(g, alpha=float(gain[1]))
             r = cv2.convertScaleAbs(r, alpha=float(gain[2]))
             warped_right = cv2.merge([b, g, r])
+
+    # Refresh the foreground-snap weight override (cheap because we only do
+    # the diff/dilate every fast_fg_update_every_n frames). Runs AFTER the
+    # exposure-gain pass so color/exposure drift doesn't masquerade as FG.
+    update_foreground_snap(warped_left, warped_right, plan, frame_idx)
 
     # Vectorized uint8 blend: each pixel = (src * weight) / 255, summed.
     # cv2.multiply with scale=1/255 saturates back to uint8 in one SIMD pass,
@@ -1186,16 +1268,25 @@ def main() -> int:
             "RCPILOT_STITCH_ACCEL must be auto, cpu, opencv-cuda, or vpi; "
             f"got {stitch_accel!r}"
         )
-    exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
+    # Lower default than before (was 15) — user reported color mismatch
+    # between left and right halves; tracking exposure at 6Hz is cheap
+    # (cv2.mean over a small overlap mask).
+    exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 5)
+    fg_snap = env_bool("RCPILOT_STITCH_FG_SNAP", True)
+    fg_threshold = env_int("RCPILOT_STITCH_FG_THRESHOLD", 30)
+    fg_dilate_px = env_int("RCPILOT_STITCH_FG_DILATE_PX", 12)
+    fg_update_every_n = env_int("RCPILOT_STITCH_FG_UPDATE_EVERY_N", 5)
 
     if left_sensor == right_sensor:
         raise SystemExit("left and right sensor ids must differ")
 
     log.info(
         "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
-        "encoder=%s bitrate=%d fast=%s accel=%s exposure_every_n=%d -> %s:%d",
+        "encoder=%s bitrate=%d fast=%s accel=%s exposure_every_n=%d "
+        "fg_snap=%s(thr=%d,dilate=%d,every=%d) -> %s:%d",
         left_sensor, right_sensor, width, height, fps, out_width, out_height,
         encoder, bitrate, use_fast, stitch_accel, exposure_every_n,
+        fg_snap, fg_threshold, fg_dilate_px, fg_update_every_n,
         cockpit_ip, port,
     )
 
@@ -1240,6 +1331,10 @@ def main() -> int:
         if h_result.detector not in {"cached", "fallback"}:
             save_calibration(calibration_path(), width, height, h_result, log)
         plan.fast_exposure_every_n = max(0, exposure_every_n)
+        plan.fast_fg_snap = fg_snap
+        plan.fast_fg_threshold = max(1, fg_threshold)
+        plan.fast_fg_dilate_px = max(0, fg_dilate_px)
+        plan.fast_fg_update_every_n = max(1, fg_update_every_n)
         if use_fast:
             bake_fast_path(
                 plan, width, height, out_width, out_height, stitch_accel, log,
