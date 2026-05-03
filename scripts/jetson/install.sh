@@ -107,14 +107,17 @@ vpi_ok = False
 vpi_reason = "vpi import failed"
 try:
     import vpi
-    src = np.zeros((4, 4, 3), dtype=np.uint8)
-    grid = vpi.WarpGrid((8, 8))
+    # VPI WarpGrid requires region width >= 64; use 128x64 for the smoke
+    # test (production warp is 2560x720, well above the minimum).
+    sw, sh = 128, 64
+    src = np.zeros((sh, sw, 3), dtype=np.uint8)
+    grid = vpi.WarpGrid((sw, sh))
     warp = vpi.WarpMap(grid)
     arr = np.asarray(warp)
-    arr[..., 0] = np.tile(np.linspace(0, 3, 8, dtype=np.float32), (8, 1))
-    arr[..., 1] = np.tile(np.linspace(0, 3, 8, dtype=np.float32).reshape(-1, 1), (1, 8))
+    arr[..., 0] = np.tile(np.linspace(0, sw - 1, sw, dtype=np.float32), (sh, 1))
+    arr[..., 1] = np.tile(np.linspace(0, sh - 1, sh, dtype=np.float32).reshape(-1, 1), (1, sw))
     src_img = vpi.asimage(src)
-    out_img = vpi.Image((8, 8), src_img.format)
+    out_img = vpi.Image((sw, sh), src_img.format)
     with vpi.Backend.CUDA:
         src_img.remap(warp, interp=vpi.Interp.LINEAR,
                       border=vpi.Border.ZERO, out=out_img)

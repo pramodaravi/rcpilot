@@ -368,18 +368,21 @@ def vpi_available() -> bool:
     except Exception:
         return False
     try:
-        # Real smoke test: build the smallest possible warp + remap and run it.
+        # Real smoke test that mirrors production kwargs. VPI's WarpGrid
+        # requires region width >= 64, so use 128x64 for the smoke test
+        # (production output is 2560x720, well above the minimum).
         import vpi as _vpi
-        src = np.zeros((4, 4, 3), dtype=np.uint8)
-        grid = _vpi.WarpGrid((8, 8))
+        smoke_w, smoke_h = 128, 64
+        src = np.zeros((smoke_h, smoke_w, 3), dtype=np.uint8)
+        grid = _vpi.WarpGrid((smoke_w, smoke_h))
         warp = _vpi.WarpMap(grid)
         arr = np.asarray(warp)
-        col = np.linspace(0, 3, 8, dtype=np.float32)
-        row = np.linspace(0, 3, 8, dtype=np.float32)
-        arr[..., 0] = np.tile(col, (8, 1))
-        arr[..., 1] = np.tile(row.reshape(-1, 1), (1, 8))
+        col = np.linspace(0, smoke_w - 1, smoke_w, dtype=np.float32)
+        row = np.linspace(0, smoke_h - 1, smoke_h, dtype=np.float32)
+        arr[..., 0] = np.tile(col, (smoke_h, 1))
+        arr[..., 1] = np.tile(row.reshape(-1, 1), (1, smoke_w))
         src_img = _vpi.asimage(src)
-        out_img = _vpi.Image((8, 8), src_img.format)
+        out_img = _vpi.Image((smoke_w, smoke_h), src_img.format)
         # Use the SAME kwargs we'll use at runtime. If border=ZERO isn't
         # supported by this VPI build, the smoke test fails and we fall
         # back to CPU rather than crash mid-stream.
