@@ -1139,6 +1139,145 @@ def save_debug_image(name: str, frame: np.ndarray, log: logging.Logger) -> None:
         log.warning("could not save stitch debug image %s: %s", name, exc)
 
 
+def save_debug_text(name: str, text: str, log: logging.Logger) -> None:
+    try:
+        path = debug_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        out = path / name
+        out.write_text(text)
+        log.warning("saved stitch debug text: %s", out)
+    except Exception as exc:
+        log.warning("could not save stitch debug text %s: %s", name, exc)
+
+
+def reset_fast_weights(plan: StitchPlan) -> None:
+    if (
+        plan.fast_weight_left_bgr is not None
+        and plan.fast_weight_right_bgr is not None
+        and plan.fast_weight_left_baked is not None
+        and plan.fast_weight_right_baked is not None
+    ):
+        np.copyto(plan.fast_weight_left_bgr, plan.fast_weight_left_baked)
+        np.copyto(plan.fast_weight_right_bgr, plan.fast_weight_right_baked)
+
+
+def overlay_mask(frame: np.ndarray, mask: Optional[np.ndarray],
+                 color: Tuple[int, int, int]) -> np.ndarray:
+    out = frame.copy()
+    if mask is None:
+        return out
+    if mask.shape[:2] != out.shape[:2]:
+        mask = cv2.resize(mask, (out.shape[1], out.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+    active = mask > 0
+    if np.count_nonzero(active) == 0:
+        return out
+    tint = np.array(color, dtype=np.float32).reshape(1, 3)
+    out[active] = np.clip(
+        out[active].astype(np.float32) * 0.45 + tint * 0.55,
+        0, 255,
+    ).astype(np.uint8)
+    return out
+
+
+def make_contact_sheet(images: Tuple[Tuple[str, np.ndarray], ...],
+                       tile_w: int = 640, tile_h: int = 180) -> np.ndarray:
+    tiles = []
+    for label, image in images:
+        tile = cv2.resize(image, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+        cv2.putText(
+            tile, label, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            tile, label, (16, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+            (0, 0, 0), 1, cv2.LINE_AA,
+        )
+        tiles.append(tile)
+    if len(tiles) % 2 == 1:
+        tiles.append(np.zeros_like(tiles[-1]))
+    rows = []
+    for idx in range(0, len(tiles), 2):
+        rows.append(np.hstack([tiles[idx], tiles[idx + 1]]))
+    return np.vstack(rows)
+
+
+def save_diagnostic_set(left: np.ndarray, right: np.ndarray,
+                        plan: StitchPlan, h_result: HomographyResult,
+                        out_w: int, out_h: int, use_fast: bool,
+                        stitch_accel: str, log: logging.Logger) -> None:
+    save_debug_image("diagnostic_left_source.jpg", left, log)
+    save_debug_image("diagnostic_right_source.jpg", right, log)
+
+    variants = []
+    if use_fast:
+        old_snap = plan.fast_fg_snap
+
+        reset_fast_weights(plan)
+        plan.fast_fg_snap = False
+        no_fg = stitch_frame_fast(left, right, plan, out_w, out_h, frame_idx=1)
+        save_debug_image("diagnostic_stitched_no_fg_snap.jpg", no_fg, log)
+        variants.append(("no fg snap", no_fg))
+
+        reset_fast_weights(plan)
+        plan.fast_fg_snap = True
+        with_fg = stitch_frame_fast(left, right, plan, out_w, out_h, frame_idx=0)
+        save_debug_image("diagnostic_stitched_fg_snap.jpg", with_fg, log)
+        variants.append(("fg snap", with_fg))
+
+        if plan.fast_fg_mask is not None:
+            save_debug_image("diagnostic_fg_mask.jpg", plan.fast_fg_mask, log)
+            save_debug_image(
+                "diagnostic_fg_overlay.jpg",
+                overlay_mask(with_fg, plan.fast_fg_mask, (0, 0, 255)),
+                log,
+            )
+        if plan.fast_overlap_mask_out is not None:
+            save_debug_image(
+                "diagnostic_overlap_overlay.jpg",
+                overlay_mask(no_fg, plan.fast_overlap_mask_out, (255, 255, 0)),
+                log,
+            )
+
+        plan.fast_fg_snap = old_snap
+        reset_fast_weights(plan)
+    else:
+        stitched = stitch_frame(left, right, plan, out_w, out_h)
+        save_debug_image("diagnostic_stitched_slow.jpg", stitched, log)
+        variants.append(("slow", stitched))
+
+    if variants:
+        left_tile = cv2.resize(left, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        right_tile = cv2.resize(right, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        sheet_images = (("left source", left_tile), ("right source", right_tile), *variants)
+        save_debug_image("diagnostic_contact_sheet.jpg", make_contact_sheet(sheet_images), log)
+
+    manifest = {
+        "detector": h_result.detector,
+        "model": h_result.model,
+        "matches": h_result.matches,
+        "inliers": h_result.inliers,
+        "inlier_ratio": h_result.ratio,
+        "reproj_error_px": h_result.reproj_error_px,
+        "canvas": [plan.canvas_w, plan.canvas_h],
+        "crop": [plan.crop_x, plan.crop_y, plan.crop_w, plan.crop_h],
+        "output": [out_w, out_h],
+        "fast": use_fast,
+        "requested_accel": stitch_accel,
+        "selected_accel": plan.fast_accel if use_fast else "slow",
+        "fg_snap": plan.fast_fg_snap,
+        "fg_threshold": plan.fast_fg_threshold,
+        "fg_dilate_px": plan.fast_fg_dilate_px,
+        "fg_update_every_n": plan.fast_fg_update_every_n,
+        "overlap_pixels": plan.overlap_pixels,
+    }
+    save_debug_text(
+        "diagnostic_manifest.json",
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        log,
+    )
+
+
 def load_calibration(path: Path, width: int, height: int,
                      log: logging.Logger) -> Optional[HomographyResult]:
     if env_bool("RCPILOT_STITCH_RECALIBRATE", False):
@@ -1286,9 +1425,13 @@ def main() -> int:
     )
     log = logging.getLogger("stitch")
 
+    diagnostic = env_bool("RCPILOT_STITCH_DIAGNOSTIC", False)
+    preview_only = env_bool("RCPILOT_STITCH_PREVIEW_ONLY", False)
     cockpit_ip = os.getenv("RCPILOT_COCKPIT_IP")
-    if not cockpit_ip:
+    if not cockpit_ip and not (diagnostic or preview_only):
         raise SystemExit("RCPILOT_COCKPIT_IP is required")
+    if not cockpit_ip:
+        cockpit_ip = "127.0.0.1"
 
     port = env_int("RCPILOT_VIDEO_PORT", 5004)
     left_sensor = env_int("RCPILOT_LEFT_SENSOR_ID", 0)
@@ -1327,10 +1470,12 @@ def main() -> int:
     log.info(
         "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
         "encoder=%s bitrate=%d fast=%s accel=%s exposure_every_n=%d "
-        "fg_snap=%s(thr=%d,dilate=%d,every=%d) -> %s:%d",
+        "fg_snap=%s(thr=%d,dilate=%d,every=%d) diagnostic=%s "
+        "preview_only=%s -> %s:%d",
         left_sensor, right_sensor, width, height, fps, out_width, out_height,
         encoder, bitrate, use_fast, stitch_accel, exposure_every_n,
         fg_snap, fg_threshold, fg_dilate_px, fg_update_every_n,
+        diagnostic, preview_only,
         cockpit_ip, port,
     )
 
@@ -1396,6 +1541,16 @@ def main() -> int:
                     preview_left, preview_right, plan, out_width, out_height,
                 )
             save_debug_image("stitched_preview.jpg", preview, log)
+
+        if diagnostic and preview_left is not None and preview_right is not None:
+            save_diagnostic_set(
+                preview_left, preview_right, plan, h_result,
+                out_width, out_height, use_fast, stitch_accel, log,
+            )
+
+        if diagnostic or preview_only:
+            log.info("diagnostic/preview-only mode complete; not opening RTP writer")
+            return 0
 
         writer = cv2.VideoWriter(
             writer_pipeline, cv2.CAP_GSTREAMER, 0, float(fps),
