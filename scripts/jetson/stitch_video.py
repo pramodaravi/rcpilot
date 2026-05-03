@@ -203,6 +203,8 @@ class HomographyResult:
     inliers: int
     matches: int
     detector: str
+    model: str = "homography"
+    reproj_error_px: float = 0.0
 
     @property
     def ratio(self) -> float:
@@ -262,11 +264,28 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
 
     pts_r = np.float32([kp_r[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     pts_l = np.float32([kp_l[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    h_small, mask = cv2.findHomography(
-        pts_r, pts_l, cv2.RANSAC, ransacReprojThreshold=4.0
-    )
+    model = os.getenv("RCPILOT_STITCH_MODEL", "affine").strip().lower()
+    if model not in {"affine", "homography"}:
+        raise SystemExit(
+            f"RCPILOT_STITCH_MODEL must be affine or homography, got {model!r}"
+        )
+
+    if model == "affine":
+        affine, mask = cv2.estimateAffinePartial2D(
+            pts_r.reshape(-1, 2), pts_l.reshape(-1, 2),
+            method=cv2.RANSAC, ransacReprojThreshold=4.0,
+            maxIters=3000, confidence=0.995, refineIters=10,
+        )
+        h_small = None
+        if affine is not None:
+            h_small = np.eye(3, dtype=np.float64)
+            h_small[:2, :] = affine
+    else:
+        h_small, mask = cv2.findHomography(
+            pts_r, pts_l, cv2.RANSAC, ransacReprojThreshold=4.0
+        )
     if h_small is None or mask is None:
-        log.warning("homography solve failed")
+        log.warning("%s solve failed", model)
         return None
 
     inliers = int(mask.ravel().sum())
@@ -275,10 +294,25 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
         log.warning("not enough stitch inliers: %d < %d", inliers, min_inliers)
         return None
 
+    projected = cv2.perspectiveTransform(pts_r, h_small)
+    errors_small = np.linalg.norm(projected - pts_l, axis=2).ravel()
+    inlier_errors = errors_small[mask.ravel().astype(bool)]
+    reproj_error_px = float(np.median(inlier_errors) / max(scale, 1e-6))
+    max_reproj = env_float("RCPILOT_STITCH_MAX_REPROJ_ERROR_PX", 12.0)
+    if reproj_error_px > max_reproj:
+        log.warning(
+            "%s reprojection error too high: %.1fpx > %.1fpx",
+            model, reproj_error_px, max_reproj,
+        )
+        return None
+
     s = np.array([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]])
     h_full = np.linalg.inv(s) @ h_small @ s
     h_full = h_full / h_full[2, 2]
-    return HomographyResult(h_full.astype(np.float64), inliers, len(good), detector_name)
+    return HomographyResult(
+        h_full.astype(np.float64), inliers, len(good), detector_name,
+        model=model, reproj_error_px=reproj_error_px,
+    )
 
 
 def approximate_homography(width: int, overlap_px: int) -> np.ndarray:
@@ -407,9 +441,30 @@ def find_clean_crop(mask: np.ndarray,
     return x0, y0, x1 - x0, y1 - y0
 
 
+def fit_crop_to_aspect(crop: Tuple[int, int, int, int],
+                       target_aspect: float) -> Tuple[int, int, int, int]:
+    x, y, w, h = crop
+    if w <= 0 or h <= 0 or target_aspect <= 0:
+        return crop
+
+    current = w / float(h)
+    if abs(current - target_aspect) < 0.01:
+        return crop
+
+    if current > target_aspect:
+        new_w = max(16, int(round(h * target_aspect)))
+        x += max(0, (w - new_w) // 2)
+        w = min(w, new_w)
+    else:
+        new_h = max(16, int(round(w / target_aspect)))
+        y += max(0, (h - new_h) // 2)
+        h = min(h, new_h)
+    return x, y, w, h
+
+
 def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
-              max_canvas_w: int, max_canvas_h: int, use_cuda: bool,
-              log: logging.Logger) -> StitchPlan:
+              max_canvas_w: int, max_canvas_h: int, output_aspect: float,
+              use_cuda: bool, log: logging.Logger) -> StitchPlan:
     left_corners = np.float32(
         [[0, 0], [width, 0], [width, height], [0, height]]
     ).reshape(-1, 1, 2)
@@ -431,7 +486,7 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
             h_right_to_left = approximate_homography(width, overlap_px=180)
             return make_plan(
                 h_right_to_left, width, height, max_canvas_w, max_canvas_h,
-                use_cuda, log,
+                output_aspect, use_cuda, log,
             )
         raise SystemExit(
             f"Estimated stitch canvas {canvas_w}x{canvas_h} is unreasonable. "
@@ -471,7 +526,7 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
     # whole overlap. Setting RCPILOT_STITCH_FEATHER_PX clips the soft band
     # to that many pixels around the seam (where left_distance == right_distance)
     # and snaps everything outside the band to the nearer camera.
-    feather_px = env_int("RCPILOT_STITCH_FEATHER_PX", 24)
+    feather_px = env_int("RCPILOT_STITCH_FEATHER_PX", 8)
     if feather_px > 0:
         overlap_full = (left_mask > 0) & (right_mask > 0)
         diff = left_distance - right_distance  # >0 = deeper into left
@@ -501,6 +556,10 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
         )
     else:
         crop_x, crop_y, crop_w, crop_h = 0, 0, canvas_w, canvas_h
+    if env_bool("RCPILOT_STITCH_KEEP_ASPECT", True):
+        crop_x, crop_y, crop_w, crop_h = fit_crop_to_aspect(
+            (crop_x, crop_y, crop_w, crop_h), output_aspect,
+        )
 
     exposure_match = env_bool("RCPILOT_STITCH_EXPOSURE_MATCH", True)
     exposure_alpha = float(
@@ -516,9 +575,11 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
 
     log.info(
         "stitch canvas=%dx%d crop=(%d,%d %dx%d) left_offset=(%d,%d) "
-        "overlap_pixels=%d feather_px=%d exposure_match=%s cuda_warp=%s",
+        "crop_aspect=%.3f target_aspect=%.3f overlap_pixels=%d "
+        "feather_px=%d exposure_match=%s cuda_warp=%s",
         canvas_w, canvas_h, crop_x, crop_y, crop_w, crop_h, tx, ty,
-        overlap_pixels, feather_px, exposure_match, cuda_ok,
+        crop_w / float(max(1, crop_h)), output_aspect, overlap_pixels,
+        feather_px, exposure_match, cuda_ok,
     )
     return StitchPlan(
         h_canvas=h_canvas.astype(np.float64),
@@ -838,7 +899,9 @@ def load_calibration(path: Path, width: int, height: int,
             return None
         log.info("loaded stitch calibration: %s", path)
         return HomographyResult(h, int(data.get("inliers", 0)),
-                                int(data.get("matches", 0)), "cached")
+                                int(data.get("matches", 0)), "cached",
+                                model=str(data.get("model", "homography")),
+                                reproj_error_px=float(data.get("reproj_error_px", 0.0)))
     except Exception as exc:
         log.warning("could not load stitch calibration %s: %s", path, exc)
         return None
@@ -856,6 +919,8 @@ def save_calibration(path: Path, width: int, height: int,
             "matches": result.matches,
             "inlier_ratio": result.ratio,
             "detector": result.detector,
+            "model": result.model,
+            "reproj_error_px": result.reproj_error_px,
             "created_at": time.time(),
         }
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -881,10 +946,12 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
     last_right_count = -1
     no_frame_samples = 0
 
+    model = os.getenv("RCPILOT_STITCH_MODEL", "affine").strip().lower()
+    max_reproj = env_float("RCPILOT_STITCH_MAX_REPROJ_ERROR_PX", 12.0)
     log.info(
         "estimating stitch alignment from %d fresh frame pairs "
-        "(min_matches=%d feature_scale=%.2f)",
-        samples, min_matches, feature_scale,
+        "(model=%s min_matches=%d feature_scale=%.2f max_error=%.1fpx)",
+        samples, model, min_matches, feature_scale, max_reproj,
     )
     for idx in range(samples):
         left, last_left_count = left_reader.wait_frame(
@@ -911,11 +978,19 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
         if result is None:
             continue
         log.info(
-            "calibration sample %d: %s matches=%d inliers=%d ratio=%.2f",
-            idx + 1, result.detector, result.matches, result.inliers,
-            result.ratio,
+            "calibration sample %d: %s/%s matches=%d inliers=%d "
+            "ratio=%.2f error=%.1fpx",
+            idx + 1, result.detector, result.model, result.matches,
+            result.inliers, result.ratio, result.reproj_error_px,
         )
-        if best is None or result.inliers > best.inliers:
+        if (
+            best is None
+            or result.inliers > best.inliers
+            or (
+                result.inliers >= best.inliers - 2
+                and result.reproj_error_px < best.reproj_error_px
+            )
+        ):
             best = result
         time.sleep(0.12)
 
@@ -934,7 +1009,10 @@ def calibrate(left_reader: CameraReader, right_reader: CameraReader,
             "a blended %dpx overlap approximation.",
             overlap,
         )
-        return HomographyResult(approximate_homography(width, overlap), 0, 0, "fallback")
+        return HomographyResult(
+            approximate_homography(width, overlap), 0, 0, "fallback",
+            model="fallback", reproj_error_px=0.0,
+        )
 
     raise SystemExit(
         "Could not estimate a real stitch between the cameras. The stream was "
@@ -1015,13 +1093,16 @@ def main() -> int:
     try:
         h_result = calibrate(left_reader, right_reader, width, height, log)
         log.info(
-            "stitch alignment: detector=%s matches=%d inliers=%d ratio=%.2f",
-            h_result.detector, h_result.matches, h_result.inliers, h_result.ratio,
+            "stitch alignment: detector=%s model=%s matches=%d inliers=%d "
+            "ratio=%.2f error=%.1fpx",
+            h_result.detector, h_result.model, h_result.matches,
+            h_result.inliers, h_result.ratio, h_result.reproj_error_px,
         )
         plan = make_plan(
             h_result.h_right_to_left, width, height,
             max_canvas_w=width * 4,
             max_canvas_h=height * 3,
+            output_aspect=out_width / float(out_height),
             use_cuda=use_cuda,
             log=log,
         )
