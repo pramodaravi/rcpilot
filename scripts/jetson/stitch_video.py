@@ -288,6 +288,21 @@ def approximate_homography(width: int, overlap_px: int) -> np.ndarray:
     return np.array([[1.0, 0.0, float(x)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
 
+def opencv_cuda_remap_available() -> bool:
+    if not hasattr(cv2, "cuda") or not hasattr(cv2.cuda, "remap"):
+        return False
+    try:
+        return cv2.cuda.getCudaEnabledDeviceCount() > 0
+    except (AttributeError, cv2.error):
+        return False
+
+
+def upload_cuda_array(array: np.ndarray):
+    gpu = cv2.cuda_GpuMat()
+    gpu.upload(array)
+    return gpu
+
+
 @dataclass
 class StitchPlan:
     h_canvas: np.ndarray
@@ -320,6 +335,14 @@ class StitchPlan:
     # against a BGR frame is one shape-matched SIMD op (no broadcast).
     fast_weight_left_bgr: Optional[np.ndarray] = None
     fast_weight_right_bgr: Optional[np.ndarray] = None
+    # Optional OpenCV CUDA remap backend. Maps are uploaded once at startup;
+    # frames still download to CPU memory because Orin Nano has no NVENC and
+    # the final H.264 encode path is software x264.
+    fast_accel: str = "cpu"
+    fast_cuda_map_left_x: Optional[object] = None
+    fast_cuda_map_left_y: Optional[object] = None
+    fast_cuda_map_right_x: Optional[object] = None
+    fast_cuda_map_right_y: Optional[object] = None
     # Single-channel uint8 mask of the overlap region at output resolution,
     # used to sample exposure cheaply without re-warping.
     fast_overlap_mask_out: Optional[np.ndarray] = None
@@ -561,7 +584,8 @@ def stitch_frame(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
 
 
 def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
-                   out_w: int, out_h: int, log: logging.Logger) -> None:
+                   out_w: int, out_h: int, accel: str,
+                   log: logging.Logger) -> None:
     """Pre-compute remap tables and weights at output resolution.
 
     The slow stitch_frame() does its work on the full canvas (which is larger
@@ -637,28 +661,32 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     plan.fast_map_left_y = left_sy
     plan.fast_map_right_x = rsx
     plan.fast_map_right_y = rsy
+    plan.fast_accel = "cpu"
+
+    if accel in {"auto", "opencv-cuda"}:
+        if opencv_cuda_remap_available():
+            try:
+                plan.fast_cuda_map_left_x = upload_cuda_array(left_sx)
+                plan.fast_cuda_map_left_y = upload_cuda_array(left_sy)
+                plan.fast_cuda_map_right_x = upload_cuda_array(rsx)
+                plan.fast_cuda_map_right_y = upload_cuda_array(rsy)
+                plan.fast_accel = "opencv-cuda"
+            except (AttributeError, cv2.error) as exc:
+                log.warning("OpenCV CUDA map upload failed; using CPU remap: %s", exc)
+                plan.fast_accel = "cpu"
+        elif accel == "opencv-cuda":
+            log.warning("RCPILOT_STITCH_ACCEL=opencv-cuda requested, but OpenCV CUDA remap is unavailable")
 
     log.info(
         "fast-path baked: out=%dx%d remap_tables=2 overlap_out_pixels=%d "
-        "exposure_every_n=%d",
+        "exposure_every_n=%d accel=%s",
         out_w, out_h, int((overlap_out > 0).sum()), plan.fast_exposure_every_n,
+        plan.fast_accel,
     )
 
 
-def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
-                      out_w: int, out_h: int, frame_idx: int) -> np.ndarray:
-    """Per-frame fast path: two remaps, sampled exposure, vectorized blend."""
-    warped_left = cv2.remap(
-        left, plan.fast_map_left_x, plan.fast_map_left_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-    warped_right = cv2.remap(
-        right, plan.fast_map_right_x, plan.fast_map_right_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-
+def finish_fast_frame(warped_left: np.ndarray, warped_right: np.ndarray,
+                      plan: StitchPlan, frame_idx: int) -> np.ndarray:
     # Sampled exposure refresh: only every N frames, and on the small overlap
     # region rather than the full canvas. Skip the work in between.
     if (
@@ -706,6 +734,55 @@ def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
         warped_right, plan.fast_weight_right_bgr, scale=1.0 / 255.0,
     )
     return cv2.add(left_contrib, right_contrib)
+
+
+def cuda_remap_fast(left: np.ndarray, right: np.ndarray,
+                    plan: StitchPlan) -> Tuple[np.ndarray, np.ndarray]:
+    gpu_left = cv2.cuda_GpuMat()
+    gpu_right = cv2.cuda_GpuMat()
+    gpu_left.upload(left)
+    gpu_right.upload(right)
+    warped_left_gpu = cv2.cuda.remap(
+        gpu_left, plan.fast_cuda_map_left_x, plan.fast_cuda_map_left_y,
+        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    warped_right_gpu = cv2.cuda.remap(
+        gpu_right, plan.fast_cuda_map_right_x, plan.fast_cuda_map_right_y,
+        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return warped_left_gpu.download(), warped_right_gpu.download()
+
+
+def cpu_remap_fast(left: np.ndarray, right: np.ndarray,
+                   plan: StitchPlan) -> Tuple[np.ndarray, np.ndarray]:
+    warped_left = cv2.remap(
+        left, plan.fast_map_left_x, plan.fast_map_left_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    warped_right = cv2.remap(
+        right, plan.fast_map_right_x, plan.fast_map_right_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return warped_left, warped_right
+
+
+def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
+                      out_w: int, out_h: int, frame_idx: int) -> np.ndarray:
+    """Per-frame fast path: two remaps, sampled exposure, vectorized blend."""
+    if plan.fast_accel == "opencv-cuda":
+        try:
+            warped_left, warped_right = cuda_remap_fast(left, right, plan)
+        except (AttributeError, cv2.error) as exc:
+            logging.getLogger("stitch").warning(
+                "OpenCV CUDA remap failed; falling back to CPU remap: %s", exc,
+            )
+            plan.fast_accel = "cpu"
+            warped_left, warped_right = cpu_remap_fast(left, right, plan)
+    else:
+        warped_left, warped_right = cpu_remap_fast(left, right, plan)
+    return finish_fast_frame(warped_left, warped_right, plan, frame_idx)
 
 
 def calibration_path() -> Path:
@@ -877,6 +954,12 @@ def main() -> int:
     x264_preset = os.getenv("RCPILOT_X264_PRESET", "superfast")
     use_cuda = env_bool("RCPILOT_STITCH_USE_CUDA", True)
     use_fast = env_bool("RCPILOT_STITCH_FAST", True)
+    stitch_accel = os.getenv("RCPILOT_STITCH_ACCEL", "auto").strip().lower()
+    if stitch_accel not in {"auto", "cpu", "opencv-cuda"}:
+        raise SystemExit(
+            "RCPILOT_STITCH_ACCEL must be auto, cpu, or opencv-cuda; "
+            f"got {stitch_accel!r}"
+        )
     exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
 
     if left_sensor == right_sensor:
@@ -884,9 +967,10 @@ def main() -> int:
 
     log.info(
         "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
-        "encoder=%s bitrate=%d fast=%s exposure_every_n=%d -> %s:%d",
+        "encoder=%s bitrate=%d fast=%s accel=%s exposure_every_n=%d -> %s:%d",
         left_sensor, right_sensor, width, height, fps, out_width, out_height,
-        encoder, bitrate, use_fast, exposure_every_n, cockpit_ip, port,
+        encoder, bitrate, use_fast, stitch_accel, exposure_every_n,
+        cockpit_ip, port,
     )
 
     left_pipeline = build_capture_pipeline(left_sensor, width, height, fps, sensor_mode)
@@ -928,7 +1012,9 @@ def main() -> int:
             save_calibration(calibration_path(), width, height, h_result, log)
         plan.fast_exposure_every_n = max(0, exposure_every_n)
         if use_fast:
-            bake_fast_path(plan, width, height, out_width, out_height, log)
+            bake_fast_path(
+                plan, width, height, out_width, out_height, stitch_accel, log,
+            )
         preview_left, _ = left_reader.latest()
         preview_right, _ = right_reader.latest()
         if preview_left is not None and preview_right is not None:
@@ -984,14 +1070,16 @@ def main() -> int:
                     gain = plan.exposure_gain
                     log.info(
                         "streaming stitched panorama: %.1f fps left=%d right=%d "
-                        "gain_bgr=(%.2f,%.2f,%.2f)",
+                        "accel=%s gain_bgr=(%.2f,%.2f,%.2f)",
                         frame_count / (now - last_log), left_count, right_count,
+                        plan.fast_accel if use_fast else "slow",
                         gain[0], gain[1], gain[2],
                     )
                 else:
                     log.info(
-                        "streaming stitched panorama: %.1f fps left=%d right=%d",
+                        "streaming stitched panorama: %.1f fps left=%d right=%d accel=%s",
                         frame_count / (now - last_log), left_count, right_count,
+                        plan.fast_accel if use_fast else "slow",
                     )
                 frame_count = 0
                 last_log = now

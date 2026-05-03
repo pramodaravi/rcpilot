@@ -68,6 +68,32 @@ for element in \
     fi
 done
 
+echo "[install] OpenCV / Jetson acceleration check:"
+/usr/bin/python3 - <<'PY'
+import cv2
+
+cuda_ok = False
+reason = "cv2.cuda.remap unavailable"
+if hasattr(cv2, "cuda") and hasattr(cv2.cuda, "remap"):
+    try:
+        cuda_ok = cv2.cuda.getCudaEnabledDeviceCount() > 0
+        if not cuda_ok:
+            reason = "no CUDA device visible to OpenCV"
+    except Exception as exc:
+        reason = str(exc)
+
+if cuda_ok:
+    print("    [ok]   OpenCV CUDA remap available for RCPILOT_STITCH_ACCEL=auto")
+else:
+    print(f"    [info] OpenCV CUDA remap not available ({reason}); CPU fast path will be used")
+
+try:
+    import vpi  # noqa: F401
+    print("    [ok]   NVIDIA VPI Python module present")
+except Exception:
+    print("    [info] NVIDIA VPI Python module not present in /usr/bin/python3")
+PY
+
 echo
 echo "[install] done."
 echo "  Activate with:    source ${VENV_DIR}/bin/activate"
