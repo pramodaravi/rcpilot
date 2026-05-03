@@ -103,11 +103,31 @@ if cuda_ok:
 else:
     print(f"    [info] OpenCV CUDA remap not available ({reason}); CPU fast path will be used")
 
+vpi_ok = False
+vpi_reason = "vpi import failed"
 try:
-    import vpi  # noqa: F401
-    print("    [ok]   NVIDIA VPI Python module present")
-except Exception:
-    print("    [info] NVIDIA VPI Python module not present in /usr/bin/python3")
+    import vpi
+    src = np.zeros((4, 4, 3), dtype=np.uint8)
+    grid = vpi.WarpGrid((8, 8))
+    warp = vpi.WarpMap(grid)
+    arr = np.asarray(warp)
+    arr[..., 0] = np.tile(np.linspace(0, 3, 8, dtype=np.float32), (8, 1))
+    arr[..., 1] = np.tile(np.linspace(0, 3, 8, dtype=np.float32).reshape(-1, 1), (1, 8))
+    src_img = vpi.asimage(src)
+    out_img = vpi.Image((8, 8), src_img.format)
+    with vpi.Backend.CUDA:
+        src_img.remap(warp, interp=vpi.Interp.LINEAR,
+                      border=vpi.Border.ZERO, out=out_img)
+    with out_img.lock_cpu() as _:
+        pass
+    vpi_ok = True
+except Exception as exc:
+    vpi_reason = f"{type(exc).__name__}: {exc}"
+
+if vpi_ok:
+    print("    [ok]   VPI CUDA remap available — RCPILOT_STITCH_ACCEL=auto will pick VPI")
+else:
+    print(f"    [info] VPI CUDA remap not available ({vpi_reason})")
 PY
 
 echo

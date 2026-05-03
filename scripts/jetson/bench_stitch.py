@@ -100,6 +100,18 @@ def main():
     else:
         print(f"  CUDA remap: skipped (accel={plan.fast_accel})")
 
+    # VPI remap path
+    if plan.fast_accel == "vpi" and hasattr(sv, "vpi_remap_fast"):
+        def stage_vpi_remap():
+            return sv.vpi_remap_fast(left, right, plan)
+        try:
+            t_vpi_remap = time_block("VPI remap x2", stage_vpi_remap, n=30)
+            print(f"  VPI remap (vpi.Image.remap x2):   {t_vpi_remap:6.2f} ms")
+        except Exception as e:
+            print(f"  VPI remap: FAILED — {type(e).__name__}: {e}")
+    else:
+        print(f"  VPI remap: skipped (accel={plan.fast_accel})")
+
     # Blend stage
     warped_left, warped_right = sv.cpu_remap_fast(left, right, plan)
 

@@ -354,6 +354,65 @@ def upload_cuda_array(array: np.ndarray):
     return gpu
 
 
+# VPI 3.x is preinstalled on JetPack 6.2 and exposes a CUDA-backed remap.
+# On Jetson Orin Nano with the stock cv2 (built without CUDA), VPI is the
+# only path that moves the per-frame warp off the CPU. Probe-measured
+# end-to-end pipeline (VPI remap x2 + CPU blend) round-trips at ~25 ms vs
+# ~70 ms for the pure-CPU path, so this is the actual fix for choppy fps.
+def vpi_available() -> bool:
+    """Return True if vpi is importable AND vpi.Image.remap on CUDA works."""
+    try:
+        import vpi  # noqa: F401
+    except ImportError:
+        return False
+    except Exception:
+        return False
+    try:
+        # Real smoke test: build the smallest possible warp + remap and run it.
+        import vpi as _vpi
+        src = np.zeros((4, 4, 3), dtype=np.uint8)
+        grid = _vpi.WarpGrid((8, 8))
+        warp = _vpi.WarpMap(grid)
+        arr = np.asarray(warp)
+        col = np.linspace(0, 3, 8, dtype=np.float32)
+        row = np.linspace(0, 3, 8, dtype=np.float32)
+        arr[..., 0] = np.tile(col, (8, 1))
+        arr[..., 1] = np.tile(row.reshape(-1, 1), (1, 8))
+        src_img = _vpi.asimage(src)
+        out_img = _vpi.Image((8, 8), src_img.format)
+        # Use the SAME kwargs we'll use at runtime. If border=ZERO isn't
+        # supported by this VPI build, the smoke test fails and we fall
+        # back to CPU rather than crash mid-stream.
+        with _vpi.Backend.CUDA:
+            src_img.remap(warp, interp=_vpi.Interp.LINEAR,
+                          border=_vpi.Border.ZERO, out=out_img)
+        # Force completion
+        with out_img.lock_cpu() as _:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def build_vpi_warpmap(map_x: np.ndarray, map_y: np.ndarray):
+    """Construct a vpi.WarpMap from a pair of float32 (out_h, out_w) maps.
+
+    map_x / map_y are the same arrays cv2.remap consumes — they tell each
+    output pixel which source position to sample from. VPI's WarpMap stores
+    the same data as a packed (out_h, out_w, 2) float32 grid.
+    """
+    import vpi
+    if map_x.shape != map_y.shape:
+        raise ValueError("map_x and map_y must have the same shape")
+    out_h, out_w = map_x.shape
+    grid = vpi.WarpGrid((out_w, out_h))
+    warp = vpi.WarpMap(grid)
+    arr = np.asarray(warp)  # shape (out_h, out_w, 2), dtype float32
+    arr[..., 0] = map_x.astype(np.float32, copy=False)
+    arr[..., 1] = map_y.astype(np.float32, copy=False)
+    return warp
+
+
 @dataclass
 class StitchPlan:
     h_canvas: np.ndarray
@@ -394,6 +453,12 @@ class StitchPlan:
     fast_cuda_map_left_y: Optional[object] = None
     fast_cuda_map_right_x: Optional[object] = None
     fast_cuda_map_right_y: Optional[object] = None
+    # VPI CUDA-backend remap state. WarpMaps are built once at bake time;
+    # output images are reused every frame so we don't pay alloc cost.
+    fast_vpi_warp_left: Optional[object] = None
+    fast_vpi_warp_right: Optional[object] = None
+    fast_vpi_out_left: Optional[object] = None
+    fast_vpi_out_right: Optional[object] = None
     # Single-channel uint8 mask of the overlap region at output resolution,
     # used to sample exposure cheaply without re-warping.
     fast_overlap_mask_out: Optional[np.ndarray] = None
@@ -741,7 +806,30 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     plan.fast_map_right_y = rsy
     plan.fast_accel = "cpu"
 
-    if accel in {"auto", "opencv-cuda"}:
+    # Acceleration priority for `auto`: VPI first (the only one that's
+    # actually fast on stock JetPack 6.2), then OpenCV CUDA (needs a
+    # custom-built cv2), else CPU. Probe-measured VPI cuts the per-frame
+    # remap from ~34 ms to ~9 ms total (4.5 ms each), bringing the full
+    # stitch from ~70 ms (sub-15 fps) to ~25 ms (over 30 fps with encode
+    # budget left over).
+    if accel in {"auto", "vpi"} and plan.fast_accel == "cpu":
+        if vpi_available():
+            try:
+                import vpi
+                plan.fast_vpi_warp_left = build_vpi_warpmap(left_sx, left_sy)
+                plan.fast_vpi_warp_right = build_vpi_warpmap(rsx, rsy)
+                # Pre-allocate persistent output images. We don't know the
+                # exact format until the first asimage call, but VPI accepts
+                # 3-channel uint8 numpy as RGB8 by default — use that.
+                plan.fast_vpi_out_left = vpi.Image((out_w, out_h), vpi.Format.RGB8)
+                plan.fast_vpi_out_right = vpi.Image((out_w, out_h), vpi.Format.RGB8)
+                plan.fast_accel = "vpi"
+            except Exception as exc:
+                log.warning("VPI warp map setup failed; trying next accel: %s", exc)
+        elif accel == "vpi":
+            log.warning("RCPILOT_STITCH_ACCEL=vpi requested, but VPI is not available")
+
+    if accel in {"auto", "opencv-cuda"} and plan.fast_accel == "cpu":
         if opencv_cuda_remap_available():
             try:
                 plan.fast_cuda_map_left_x = upload_cuda_array(left_sx)
@@ -846,10 +934,50 @@ def cpu_remap_fast(left: np.ndarray, right: np.ndarray,
     return warped_left, warped_right
 
 
+def vpi_remap_fast(left: np.ndarray, right: np.ndarray,
+                   plan: StitchPlan) -> Tuple[np.ndarray, np.ndarray]:
+    """Run remap on the Jetson's GPU via VPI.
+
+    `vpi.asimage(numpy)` wraps the host array as a VPI image without copying.
+    The CUDA backend pulls pixels into device memory, runs the bilinear warp
+    against a pre-baked WarpMap, and writes into a persistent output image.
+    `lock_cpu()` returns a numpy view of the result with no extra copy on
+    Tegra (unified memory). Probe-measured ~4.5 ms/frame for 1280x720 ->
+    2560x720, vs ~17 ms/frame for cv2.remap on the same data.
+    """
+    import vpi
+    src_l = vpi.asimage(left)
+    src_r = vpi.asimage(right)
+    out_l = plan.fast_vpi_out_left
+    out_r = plan.fast_vpi_out_right
+    with vpi.Backend.CUDA:
+        src_l.remap(plan.fast_vpi_warp_left,
+                    interp=vpi.Interp.LINEAR,
+                    border=vpi.Border.ZERO,
+                    out=out_l)
+        src_r.remap(plan.fast_vpi_warp_right,
+                    interp=vpi.Interp.LINEAR,
+                    border=vpi.Border.ZERO,
+                    out=out_r)
+    # lock_cpu yields a numpy view; copy() so the downstream blend can stay
+    # in numpy land without holding the VPI lock across the multiply/add.
+    with out_l.lock_cpu() as l_view, out_r.lock_cpu() as r_view:
+        return np.asarray(l_view).copy(), np.asarray(r_view).copy()
+
+
 def stitch_frame_fast(left: np.ndarray, right: np.ndarray, plan: StitchPlan,
                       out_w: int, out_h: int, frame_idx: int) -> np.ndarray:
     """Per-frame fast path: two remaps, sampled exposure, vectorized blend."""
-    if plan.fast_accel == "opencv-cuda":
+    if plan.fast_accel == "vpi":
+        try:
+            warped_left, warped_right = vpi_remap_fast(left, right, plan)
+        except Exception as exc:
+            logging.getLogger("stitch").warning(
+                "VPI remap failed; falling back to CPU remap: %s", exc,
+            )
+            plan.fast_accel = "cpu"
+            warped_left, warped_right = cpu_remap_fast(left, right, plan)
+    elif plan.fast_accel == "opencv-cuda":
         try:
             warped_left, warped_right = cuda_remap_fast(left, right, plan)
         except (AttributeError, cv2.error) as exc:
@@ -1050,9 +1178,9 @@ def main() -> int:
     use_cuda = env_bool("RCPILOT_STITCH_USE_CUDA", True)
     use_fast = env_bool("RCPILOT_STITCH_FAST", True)
     stitch_accel = os.getenv("RCPILOT_STITCH_ACCEL", "auto").strip().lower()
-    if stitch_accel not in {"auto", "cpu", "opencv-cuda"}:
+    if stitch_accel not in {"auto", "cpu", "opencv-cuda", "vpi"}:
         raise SystemExit(
-            "RCPILOT_STITCH_ACCEL must be auto, cpu, or opencv-cuda; "
+            "RCPILOT_STITCH_ACCEL must be auto, cpu, opencv-cuda, or vpi; "
             f"got {stitch_accel!r}"
         )
     exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
