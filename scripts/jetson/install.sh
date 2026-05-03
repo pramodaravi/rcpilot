@@ -71,14 +71,30 @@ done
 echo "[install] OpenCV / Jetson acceleration check:"
 /usr/bin/python3 - <<'PY'
 import cv2
+import numpy as np
 
 cuda_ok = False
 reason = "cv2.cuda.remap unavailable"
-if hasattr(cv2, "cuda") and hasattr(cv2.cuda, "remap"):
+if hasattr(cv2, "cuda") and hasattr(cv2, "cuda_GpuMat") and hasattr(cv2.cuda, "remap"):
     try:
-        cuda_ok = cv2.cuda.getCudaEnabledDeviceCount() > 0
-        if not cuda_ok:
+        if cv2.cuda.getCudaEnabledDeviceCount() <= 0:
             reason = "no CUDA device visible to OpenCV"
+        else:
+            src = np.zeros((2, 2, 3), dtype=np.uint8)
+            map_x = np.array([[0, 1], [0, 1]], dtype=np.float32)
+            map_y = np.array([[0, 0], [1, 1]], dtype=np.float32)
+            gpu_src = cv2.cuda_GpuMat()
+            gpu_x = cv2.cuda_GpuMat()
+            gpu_y = cv2.cuda_GpuMat()
+            gpu_src.upload(src)
+            gpu_x.upload(map_x)
+            gpu_y.upload(map_y)
+            out = cv2.cuda.remap(
+                gpu_src, gpu_x, gpu_y, cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+            out.download()
+            cuda_ok = True
     except Exception as exc:
         reason = str(exc)
 

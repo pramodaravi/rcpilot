@@ -289,10 +289,27 @@ def approximate_homography(width: int, overlap_px: int) -> np.ndarray:
 
 
 def opencv_cuda_remap_available() -> bool:
-    if not hasattr(cv2, "cuda") or not hasattr(cv2.cuda, "remap"):
+    if (
+        not hasattr(cv2, "cuda")
+        or not hasattr(cv2, "cuda_GpuMat")
+        or not hasattr(cv2.cuda, "remap")
+    ):
         return False
     try:
-        return cv2.cuda.getCudaEnabledDeviceCount() > 0
+        if cv2.cuda.getCudaEnabledDeviceCount() <= 0:
+            return False
+        src = np.zeros((2, 2, 3), dtype=np.uint8)
+        map_x = np.array([[0, 1], [0, 1]], dtype=np.float32)
+        map_y = np.array([[0, 0], [1, 1]], dtype=np.float32)
+        gpu_src = upload_cuda_array(src)
+        gpu_x = upload_cuda_array(map_x)
+        gpu_y = upload_cuda_array(map_y)
+        out = cv2.cuda.remap(
+            gpu_src, gpu_x, gpu_y, cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+        out.download()
+        return True
     except (AttributeError, cv2.error):
         return False
 
