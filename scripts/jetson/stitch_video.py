@@ -957,10 +957,10 @@ def update_foreground_snap(warped_left: np.ndarray, warped_right: np.ndarray,
     plan.fast_fg_timing_total_ms += total
     plan.fast_fg_timing_count += 1
 
-    # Log per-stage timing every ~3s of refreshes so we can see what's
-    # actually slow on real hardware. At update_every_n=10 this fires
-    # every ~10s of wall clock at 30fps, so it's not spammy.
-    if plan.fast_fg_timing_count >= 30:
+    # Log per-stage timing every 10 refreshes so we can see what's
+    # actually slow on real hardware without waiting forever for the
+    # first sample. At update_every_n=10 this fires every ~3s at 30fps.
+    if plan.fast_fg_timing_count >= 10:
         avg = plan.fast_fg_timing_total_ms / plan.fast_fg_timing_count
         logging.getLogger("stitch").info(
             "fg-snap timing avg=%.2fms over %d refreshes "
@@ -1314,8 +1314,12 @@ def main() -> int:
     exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
     fg_snap = env_bool("RCPILOT_STITCH_FG_SNAP", True)
     fg_threshold = env_int("RCPILOT_STITCH_FG_THRESHOLD", 30)
-    fg_dilate_px = env_int("RCPILOT_STITCH_FG_DILATE_PX", 12)
-    fg_update_every_n = env_int("RCPILOT_STITCH_FG_UPDATE_EVERY_N", 5)
+    # Defaults tuned after measuring fg-snap perf on the bench Jetson:
+    # dilate=12 (25x25 kernel) cost too much, dilate=6 (13x13) is enough
+    # to bridge a hand's interior; refresh every 10 frames (~3Hz at 30fps)
+    # is plenty for hand motion in a cockpit scene.
+    fg_dilate_px = env_int("RCPILOT_STITCH_FG_DILATE_PX", 6)
+    fg_update_every_n = env_int("RCPILOT_STITCH_FG_UPDATE_EVERY_N", 10)
 
     if left_sensor == right_sensor:
         raise SystemExit("left and right sensor ids must differ")
