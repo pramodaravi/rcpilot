@@ -4,7 +4,7 @@ Control + video + telemetry stack for the **Full Throttle Karting RC arcade attr
 
 ## Status
 
-- **Today:** the bench loop works end-to-end. IMX219 camera → Jetson Orin Nano (software-encoded H.264) → Wi-Fi/USB-C network → cockpit display. Control packets travel back the other way at 250 Hz with measured ~5 ms RTT over USB-C virtual ethernet. Force-feedback synthesis, sensor stack, and motor drivers are stubbed (no hardware connected yet).
+- **Today:** the bench loop works end-to-end. Two IMX219 cameras -> Jetson Orin Nano real-time warped/blended 2560x720 H.264 panorama -> Wi-Fi/USB-C network -> cockpit display. Control packets travel back the other way at 250 Hz with measured ~5 ms RTT over USB-C virtual ethernet. Force-feedback synthesis, sensor stack, and motor drivers are stubbed (no hardware connected yet).
 - **Blocked on:** Jetson Orin NX 8GB module ordering (~$450, ~2-week lead). Once it lands, swap the Nano module → NX module on the existing dev kit carrier, set `RCPILOT_ENCODER=nvv4l2h264enc`, and end-to-end glass-to-glass latency drops from ~100 ms to ~35 ms.
 
 ## Repo layout
@@ -32,7 +32,9 @@ rcpilot/
 │   └── test_loop.py        # localhost integration test
 ├── scripts/
 │   ├── jetson/
-│   │   ├── start_video.sh  # GStreamer video sender
+│   │   ├── start_video.sh  # single-camera GStreamer video sender
+│   │   ├── start_video_stitched.sh  # two-camera real panorama sender
+│   │   ├── stitch_video.py  # OpenCV alignment, warp, feather blend, RTP out
 │   │   └── install.sh      # idempotent Jetson install
 │   ├── cockpit/
 │   │   ├── view_video.ps1  # Windows GStreamer receiver
@@ -46,52 +48,49 @@ rcpilot/
     └── deployment.md       # per-host bring-up
 ```
 
-## Quick start
+## Hit Play (the daily flow)
 
-### Jetson side (the car)
+Once the one-time setup below has been done on each machine, the recurring workflow is:
+
+1. **Power on the Jetson.** Wait ~30 seconds. systemd brings up `rcpilot-echo` and `rcpilot-video` automatically — both cameras, the stitched RTP H.264 stream, and the UDP echo server are all running before you sit down at the cockpit.
+2. **Open Unity** at `unity/unity-driver-station/` and **hit Play**. The Bootstrapper auto-spawns the local Python video-bridge sidecar, opens the control socket, and starts painting frames. The HUD shows link state ("LINK OK / DEGRADED / NO LINK") and RTT in the top-left.
+3. **Drive.**
+
+That's it. No SSH, no terminal, no script juggling. If link state stays NO LINK for more than ~5 seconds, see *When it doesn't work* below.
+
+## One-time setup
+
+### Jetson side (the car) — once per Jetson
 
 ```bash
-git clone <repo> rcpilot && cd rcpilot
-sudo bash scripts/jetson/install.sh
-
-# Activate the venv the installer created.
-source /opt/rcpilot/venv/bin/activate
-
-# Run the echo server in one shell.
-rcpilot-echo-server -v
-
-# In a second shell, run the video sender pointed at the cockpit:
-RCPILOT_COCKPIT_IP=192.168.55.100 bash scripts/jetson/start_video.sh
+git clone <repo> ~/rcpilot && cd ~/rcpilot
+sudo bash scripts/jetson/install.sh           # creates venv, installs deps
+sudo bash scripts/jetson/install_services.sh  # enables auto-start on boot
 ```
 
-### Cockpit side (Windows)
+`install_services.sh` is what makes "hit play and it just works" possible — it installs both systemd units, drops a documented `/etc/default/rcpilot-video` env file with every tunable, and enables the services so they come up on every boot.
+
+To change a runtime knob (e.g. switch the seam-snap to skin-tone for testing):
+
+```bash
+sudo $EDITOR /etc/default/rcpilot-video      # uncomment a line, save
+sudo systemctl restart rcpilot-video          # ~3s, then back to streaming
+```
+
+The defaults file is preserved across re-runs of `install_services.sh` — your edits won't be clobbered when you pull and re-install.
+
+### Cockpit side (Windows) — once per cockpit
 
 ```powershell
-# One-time setup
 git clone <repo> rcpilot
 cd rcpilot
 python -m pip install -e .[cockpit,dev]
 
-# Identify your wheel/controller's axis layout (one-time):
+# One-time: identify your wheel's axis layout. Wiggle each control, note
+# which axis is which, edit config/local.yaml.
 rcpilot-identify-joystick
-# Wiggle each control, note which axis is which, edit config/local.yaml.
 
-# Start the video receiver:
-.\scripts\cockpit\view_video.ps1
-
-# In a separate window, start the control sender:
-.\scripts\cockpit\start_sender.ps1
-```
-
-### Cockpit side (macOS / Linux)
-
-```bash
-git clone <repo> rcpilot && cd rcpilot
-python3 -m pip install -e .[cockpit,dev]
-
-# Same workflow, bash equivalents:
-bash scripts/cockpit/view_video.sh
-python -m rcpilot.cockpit.control_sender
+# Open unity/unity-driver-station/ in Unity 2022.3.47f1 and hit Play.
 ```
 
 ### Running locally without any hardware
@@ -100,6 +99,25 @@ python -m rcpilot.cockpit.control_sender
 pip install -e .[dev]
 pytest                              # full test suite
 bash scripts/dev/run_local_loop.sh  # fake echo + sender on 127.0.0.1
+```
+
+## When it doesn't work
+
+| Symptom | First thing to check |
+| --- | --- |
+| HUD says NO LINK after Play | Jetson powered on? On the same Wi-Fi? Try `ping 192.168.1.53` from the cockpit. |
+| Link OK but black video | `journalctl -u rcpilot-video -f` on the Jetson. Camera open errors → `sudo systemctl restart nvargus-daemon`. |
+| Doubled hand in the overlap region | Set `RCPILOT_STITCH_SEG=skin` in `/etc/default/rcpilot-video` and restart. Real ML segmentation (`yolo26`) is the long-term fix. |
+| Cameras moved, image looks wrong | Set `RCPILOT_STITCH_RECALIBRATE=1` in `/etc/default/rcpilot-video`, restart, then revert the flag once the new homography is cached. |
+| Cockpit IP changed (new DHCP lease) | `RCPILOT_COCKPIT_IP=<new-ip>` in `/etc/default/rcpilot-video`, restart. |
+
+For deeper debugging, you can still run the pipeline manually instead of through systemd:
+
+```bash
+sudo systemctl stop rcpilot-video
+RCPILOT_COCKPIT_IP=192.168.1.247 \
+  RCPILOT_STITCH_SEG=skin \
+  bash scripts/jetson/start_video_stitched.sh
 ```
 
 ## Configuration
@@ -118,8 +136,8 @@ control:
     brake: 4
     clutch: 1
 video:
-  encoder: x264enc          # change to nvv4l2h264enc after Orin NX swap
-  bitrate_kbps: 8000
+  encoder: x264enc          # change to nvv4l2h264enc on modules with NVENC
+  bitrate_kbps: 18000       # dual-camera panorama sender default
 ```
 
 The Python entries (`rcpilot-echo-server`, `rcpilot-control-sender`) all accept `--config <path>` to point at any YAML file. The `start_video.sh` Jetson script reads the same values via env vars (`RCPILOT_COCKPIT_IP`, `RCPILOT_ENCODER`, etc.).

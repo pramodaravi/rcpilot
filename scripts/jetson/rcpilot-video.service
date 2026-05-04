@@ -17,14 +17,18 @@ Type=simple
 User=adm2n
 Group=adm2n
 WorkingDirectory=/home/adm2n/rcpilot
-# Cockpit IP for the Wi-Fi bench bring-up (Starlink subnet). If the cockpit
-# machine ever takes a different DHCP lease, override with a drop-in:
-#   sudo systemctl edit rcpilot-video.service
-#   [Service]
-#   Environment=RCPILOT_COCKPIT_IP=<new-cockpit-ip>
-# The previous USB-C cockpit IP was 192.168.55.100; switch back via a drop-in
-# if the Wi-Fi link is unavailable for a session.
+# Cockpit IP for the Wi-Fi bench bring-up (Starlink subnet). This is the
+# unit-file default; /etc/default/rcpilot-video can override it without
+# touching the unit. If neither sets RCPILOT_COCKPIT_IP, start_video.sh
+# refuses to start (which is what we want — silently sending video to the
+# wrong host is worse than a clear failure).
 Environment=RCPILOT_COCKPIT_IP=192.168.1.247
+# Per-host config drop-in. Edit /etc/default/rcpilot-video to change
+# RCPILOT_STITCH_SEG, RCPILOT_STITCH_ACCEL, RCPILOT_ENCODER, etc. without
+# `systemctl edit`. The leading `-` makes the file optional, so a Jetson
+# that hasn't been re-installed since this change still boots fine using
+# only the unit-file Environment= defaults above.
+EnvironmentFile=-/etc/default/rcpilot-video
 ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video_stitched.sh
 # Restart only on actual process failure. The current Python stitcher exits
 # non-zero for camera/open/calibration failures, and exits cleanly on SIGTERM

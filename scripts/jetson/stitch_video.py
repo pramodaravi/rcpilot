@@ -28,6 +28,23 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+# Optional pluggable segmentation-seam provider. v0.3 introduces a new env
+# var RCPILOT_STITCH_SEG (off|absdiff|skin|yolo26) that picks how the
+# foreground mask is computed for the seam-snap. When unset, the legacy
+# hardcoded absdiff path runs unchanged so v0.2 production behavior is
+# preserved bit-for-bit. Import is wrapped because the module sits next to
+# this script and may be missing on stripped deployments — we never want a
+# missing import to take video down.
+try:
+    import seg_seam
+    _SEG_AVAILABLE = True
+except ImportError:
+    seg_seam = None  # type: ignore
+    _SEG_AVAILABLE = False
+
+_SEG_PROVIDER: Optional[object] = None
+_SEG_INIT_FAILED = False
+
 
 def env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -294,10 +311,34 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
         log.warning("not enough stitch inliers: %d < %d", inliers, min_inliers)
         return None
 
+    # New as of 2026-05-04 after the singular-matrix crash loop: gate on
+    # inlier *ratio*, not just absolute count. A 160-match scene yielding
+    # only 18 inliers (ratio 0.11) is RANSAC saying "I can't actually
+    # explain these correspondences with one transform" — typically because
+    # the affine collapsed to identity to maximize trivial inliers. Real
+    # cross-camera homographies on textured scenes hit 0.5+.
+    inlier_ratio = inliers / max(1, len(good))
+    min_ratio = env_float("RCPILOT_STITCH_MIN_INLIER_RATIO", 0.30)
+    if inlier_ratio < min_ratio:
+        log.warning(
+            "stitch inlier ratio too low: %.2f < %.2f (inliers=%d matches=%d)",
+            inlier_ratio, min_ratio, inliers, len(good),
+        )
+        return None
+
     projected = cv2.perspectiveTransform(pts_r, h_small)
     errors_small = np.linalg.norm(projected - pts_l, axis=2).ravel()
     inlier_errors = errors_small[mask.ravel().astype(bool)]
     reproj_error_px = float(np.median(inlier_errors) / max(scale, 1e-6))
+    # An *exactly-zero* reproj error is impossible with real cameras and
+    # usually means RANSAC found a trivial identity-like model. Reject it
+    # before it gets cached.
+    if reproj_error_px <= 0.05:
+        log.warning(
+            "stitch reproj error suspiciously clean: %.3fpx (likely degenerate fit)",
+            reproj_error_px,
+        )
+        return None
     max_reproj = env_float("RCPILOT_STITCH_MAX_REPROJ_ERROR_PX", 12.0)
     if reproj_error_px > max_reproj:
         log.warning(
@@ -788,7 +829,24 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     left_sy = (cy_full - float(plan.left_y)).astype(np.float32)
 
     # Right camera: invert the canvas homography.
-    h_inv = np.linalg.inv(plan.h_canvas).astype(np.float64)
+    # Wrap with a clear error: a singular h_canvas means the upstream
+    # homography (cached or freshly fit) was degenerate. Without this
+    # wrapper, the Python traceback drops into systemd, which respawns into
+    # the same crash — that's the 572-restart-loop pattern we hit on
+    # 2026-05-04. Now we exit non-zero with a message that points at the
+    # actual fix (delete the cache or RCPILOT_STITCH_RECALIBRATE=1).
+    try:
+        h_inv = np.linalg.inv(plan.h_canvas).astype(np.float64)
+    except np.linalg.LinAlgError as exc:
+        raise SystemExit(
+            f"stitch homography is singular and cannot be inverted ({exc}). "
+            "This usually means a degenerate cached calibration slipped "
+            "through the loader's health gates. Fix one of: "
+            "(1) rm /home/adm2n/rcpilot/config/stitch_calibration.json then "
+            "    restart the service to re-calibrate; "
+            "(2) set RCPILOT_STITCH_RECALIBRATE=1 to ignore the cache; "
+            "(3) re-aim cameras at a textured scene before re-calibrating."
+        ) from exc
     flat_x = cx_full.ravel().astype(np.float64)
     flat_y = cy_full.ravel().astype(np.float64)
     homo = np.stack([flat_x, flat_y, np.ones_like(flat_x)], axis=0)  # (3, N)
@@ -898,6 +956,59 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
     )
 
 
+def _resolve_seg_provider():
+    """Return the configured seg_seam provider, or None to use legacy absdiff.
+
+    Selected by RCPILOT_STITCH_SEG. Cached after first init so we pay model
+    load / scratch alloc cost once. If the requested provider fails to
+    construct (e.g. RCPILOT_STITCH_SEG=yolo26 but ultralytics isn't
+    installed) we log once and never retry — the failure is sticky for the
+    life of the process so we don't spam warnings every frame.
+    """
+    global _SEG_PROVIDER, _SEG_INIT_FAILED
+    if _SEG_INIT_FAILED:
+        return None
+    if _SEG_PROVIDER is not None:
+        return _SEG_PROVIDER
+    selected = os.getenv("RCPILOT_STITCH_SEG")
+    if not selected:
+        return None  # unset → keep v0.2 legacy path
+    if not _SEG_AVAILABLE or seg_seam is None:
+        logging.getLogger("stitch").warning(
+            "RCPILOT_STITCH_SEG=%s requested but seg_seam module not importable; "
+            "falling back to legacy absdiff", selected,
+        )
+        _SEG_INIT_FAILED = True
+        return None
+    try:
+        _SEG_PROVIDER = seg_seam.get_provider(selected)
+        logging.getLogger("stitch").info(
+            "seg_seam provider initialized: %s (RCPILOT_STITCH_SEG=%s)",
+            getattr(_SEG_PROVIDER, "name", "?"), selected,
+        )
+        return _SEG_PROVIDER
+    except Exception as exc:
+        logging.getLogger("stitch").warning(
+            "seg_seam provider %r failed to init (%s: %s); falling back to "
+            "legacy absdiff", selected, type(exc).__name__, exc,
+        )
+        _SEG_INIT_FAILED = True
+        return None
+
+
+def _apply_seg_mask(plan: StitchPlan, mask: np.ndarray) -> int:
+    """Reset weights to their baked feather values, then snap masked pixels
+    to the LEFT camera. Returns the number of pixels that got snapped."""
+    np.copyto(plan.fast_weight_left_bgr, plan.fast_weight_left_baked)
+    np.copyto(plan.fast_weight_right_bgr, plan.fast_weight_right_baked)
+    fg_bool = mask > 0
+    n = int(np.count_nonzero(fg_bool))
+    if n > 0:
+        plan.fast_weight_left_bgr[fg_bool] = 255
+        plan.fast_weight_right_bgr[fg_bool] = 0
+    return n
+
+
 def update_foreground_snap(warped_left: np.ndarray, warped_right: np.ndarray,
                            plan: StitchPlan, frame_idx: int) -> None:
     """Refresh the runtime weight maps so foreground (parallax-affected)
@@ -906,12 +1017,57 @@ def update_foreground_snap(warped_left: np.ndarray, warped_right: np.ndarray,
     Cost-optimized: uses pre-allocated scratch buffers, grayscale diff
     (3x cheaper than channel-max-of-3), in-place dst= ops everywhere,
     in-place boolean-index weight modification (no fresh allocation).
+
+    v0.3: if RCPILOT_STITCH_SEG is set, dispatch to the seg_seam provider
+    instead of running the legacy absdiff math here. The provider handles
+    its own cadence and scratch buffers; we only own the weight-apply step.
     """
     if (not plan.fast_fg_snap
             or plan.fast_weight_left_baked is None
             or plan.fast_weight_right_baked is None
-            or plan.fast_overlap_mask_out is None
-            or plan.fast_fg_update_every_n <= 0
+            or plan.fast_overlap_mask_out is None):
+        return
+
+    # v0.3 path — pluggable segmentation. Returns None when the provider
+    # self-cadences and decides to skip this frame; in that case we leave
+    # the runtime weights alone (last refresh's snap remains in effect).
+    provider = _resolve_seg_provider()
+    if provider is not None:
+        try:
+            new_mask = provider.mask(
+                warped_left, warped_right, frame_idx,
+                plan.fast_overlap_mask_out,
+            )
+        except Exception as exc:
+            logging.getLogger("stitch").warning(
+                "seg_seam provider %r raised at frame %d: %s; "
+                "disabling provider for the rest of this run",
+                getattr(provider, "name", "?"), frame_idx, exc,
+            )
+            global _SEG_INIT_FAILED
+            _SEG_INIT_FAILED = True
+            new_mask = None
+        if new_mask is not None:
+            t0 = time.perf_counter()
+            n_snapped = _apply_seg_mask(plan, new_mask)
+            apply_ms = (time.perf_counter() - t0) * 1000
+            plan.fast_fg_timing_total_ms += apply_ms
+            plan.fast_fg_timing_count += 1
+            if plan.fast_fg_timing_count >= 10:
+                avg = plan.fast_fg_timing_total_ms / plan.fast_fg_timing_count
+                logging.getLogger("stitch").info(
+                    "seg-seam(%s) apply avg=%.2fms over %d refreshes "
+                    "(this: apply=%.2fms snapped_pixels=%d)",
+                    getattr(provider, "name", "?"),
+                    avg, plan.fast_fg_timing_count, apply_ms, n_snapped,
+                )
+                plan.fast_fg_timing_total_ms = 0.0
+                plan.fast_fg_timing_count = 0
+        return
+
+    # Legacy v0.2 path — preserved exactly so RCPILOT_STITCH_SEG unset gives
+    # the same production behavior as before this commit.
+    if (plan.fast_fg_update_every_n <= 0
             or plan.fast_fg_gray_left is None):
         return
     if (frame_idx % plan.fast_fg_update_every_n) != 0:
@@ -1278,6 +1434,66 @@ def save_diagnostic_set(left: np.ndarray, right: np.ndarray,
     )
 
 
+def _calibration_health(h: np.ndarray, ratio: float, error_px: float,
+                        width: int) -> Optional[str]:
+    """Return None if the cached homography looks usable. Return a human-readable
+    reason string if it should be rejected.
+
+    Catches the failure mode that crashed the service in a 572-restart loop on
+    2026-05-04: a degenerate affine RANSAC fit collapses to (near-)identity,
+    saves a homography with reproj_error=0.0 and inlier_ratio=0.11, and the
+    next bake_fast_path() crashes inside np.linalg.inv(plan.h_canvas).
+
+    The four gates here mirror what `estimate_homography` requires of a fresh
+    fit. We re-validate at load time because old caches predate these gates.
+    """
+    if h.shape != (3, 3):
+        return f"shape {h.shape} != (3, 3)"
+    det = float(np.linalg.det(h))
+    if abs(det) < 1e-9:
+        return f"near-singular det={det:.2e}"
+    try:
+        cond = float(np.linalg.cond(h))
+    except Exception:
+        cond = float("inf")
+    # Real-world stitch homographies are well-conditioned (cond < 1e3 typical).
+    # 1e8 is generous; anything past that means the matrix is almost rank-2.
+    if cond > 1e8:
+        return f"ill-conditioned cond={cond:.2e}"
+    if error_px <= 0.05:
+        # A perfect zero-pixel reproj error is impossible with real cameras.
+        # Either RANSAC collapsed to identity or the cache is synthetic.
+        return f"impossibly clean fit error={error_px:.2f}px (likely degenerate)"
+    if ratio is not None and ratio < 0.30:
+        return f"inlier ratio too low: {ratio:.2f} < 0.30"
+    # Identity-shaped homographies (the smoking gun on 2026-05-04): a real
+    # cross-camera homography produces a *canvas* meaningfully wider than
+    # one camera. Identity gives canvas_w == width; that's exactly the
+    # canvas=1280x720 we saw in the broken journal. Project all four
+    # corners of the right camera and require the canvas extent to grow
+    # by at least 5%. The 5% threshold accommodates legit setups with
+    # heavy camera overlap while still catching identity / near-identity.
+    corners = np.array(
+        [[0.0,           0.0,           1.0],
+         [float(width),  0.0,           1.0],
+         [float(width),  1.0,           1.0],
+         [0.0,           1.0,           1.0]],
+        dtype=np.float64,
+    ).T  # (3, 4)
+    proj = h @ corners
+    if np.any(np.abs(proj[2, :]) < 1e-9):
+        return "homography projects a corner to line at infinity"
+    proj_x = proj[0, :] / proj[2, :]
+    canvas_w = max(float(width), float(np.max(proj_x))) - min(0.0, float(np.min(proj_x)))
+    if canvas_w < width * 1.05:
+        return (
+            f"homography is identity-shaped: implied canvas width "
+            f"{canvas_w:.0f}px is barely wider than one camera ({width}px). "
+            f"This will collapse stitch output to a single-camera view."
+        )
+    return None
+
+
 def load_calibration(path: Path, width: int, height: int,
                      log: logging.Logger) -> Optional[HomographyResult]:
     if env_bool("RCPILOT_STITCH_RECALIBRATE", False):
@@ -1292,11 +1508,23 @@ def load_calibration(path: Path, width: int, height: int,
         h = np.array(data["h_right_to_left"], dtype=np.float64)
         if h.shape != (3, 3):
             return None
+        ratio = float(data.get("inlier_ratio", 0.0))
+        error_px = float(data.get("reproj_error_px", 0.0))
+        # Guard: the saved homography may be a degenerate fit (see comment on
+        # _calibration_health). Reject and re-calibrate instead of crashing
+        # downstream.
+        reason = _calibration_health(h, ratio, error_px, width)
+        if reason is not None:
+            log.warning(
+                "rejecting cached stitch calibration %s — %s. Re-calibrating.",
+                path, reason,
+            )
+            return None
         log.info("loaded stitch calibration: %s", path)
         return HomographyResult(h, int(data.get("inliers", 0)),
                                 int(data.get("matches", 0)), "cached",
                                 model=str(data.get("model", "homography")),
-                                reproj_error_px=float(data.get("reproj_error_px", 0.0)))
+                                reproj_error_px=error_px)
     except Exception as exc:
         log.warning("could not load stitch calibration %s: %s", path, exc)
         return None
@@ -1481,6 +1709,7 @@ def main() -> int:
 
     left_pipeline = build_capture_pipeline(left_sensor, width, height, fps, sensor_mode)
     right_pipeline = build_capture_pipeline(right_sensor, width, height, fps, sensor_mode)
+
     writer_pipeline = build_writer_pipeline(
         cockpit_ip, port, out_width, out_height, fps, bitrate,
         encoder, key_interval, x264_preset,
