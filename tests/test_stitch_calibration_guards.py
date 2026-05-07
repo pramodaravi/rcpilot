@@ -200,3 +200,34 @@ def test_bake_fast_path_raises_systemexit_on_singular_h_canvas():
     assert "singular" in msg.lower()
     # Must hint at remediation so an operator can fix it without reading source.
     assert "stitch_calibration.json" in msg or "RCPILOT_STITCH_RECALIBRATE" in msg
+
+
+# ---------------------------------------------------------------------------
+# vpi_blend_fast — VIC/CUDA backend with cv2 fallback
+# ---------------------------------------------------------------------------
+
+
+def test_vpi_blend_resolver_returns_none_or_dict():
+    """The op resolver should never raise; it should return None when VPI
+    isn't installed, or a dict with mul/add/backend when it is."""
+    result = sv._resolve_vpi_blend_ops()
+    assert result is None or (
+        isinstance(result, dict)
+        and {"vpi", "mul", "add", "backend"}.issubset(result)
+    )
+
+
+def test_vpi_blend_fast_raises_helpfully_when_unavailable(monkeypatch):
+    """When VPI ops can't be resolved, vpi_blend_fast must raise RuntimeError
+    with a clear message — finish_fast_frame() catches it and falls back to
+    the cv2 path permanently. Never silently return garbage."""
+    monkeypatch.setattr(sv, "_VPI_BLEND_OPS", None)
+    monkeypatch.setattr(sv, "_resolve_vpi_blend_ops", lambda: None)
+    h = 64
+    w = 128
+    warped = np.zeros((h, w, 3), dtype=np.uint8)
+    plan = type("FakePlan", (), {})()
+    plan.fast_weight_left_bgr = np.full((h, w, 3), 128, dtype=np.uint8)
+    plan.fast_weight_right_bgr = 255 - plan.fast_weight_left_bgr
+    with pytest.raises(RuntimeError, match="VPI blend ops not available"):
+        sv.vpi_blend_fast(warped, warped, plan)

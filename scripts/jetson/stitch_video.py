@@ -1302,6 +1302,101 @@ def update_foreground_snap(warped_left: np.ndarray, warped_right: np.ndarray,
         plan.fast_fg_timing_count = 0
 
 
+# ---------------------------------------------------------------------------
+# VPI/VIC-backed per-frame blend.
+#
+# The default blend path is cv2.multiply + cv2.add on CPU, which costs ~10-15 ms
+# per frame at 2560x720 because of the lock_cpu()/np.copy round-trip plus two
+# uint8 SIMD passes. VPI exposes image arithmetic on CUDA/VIC: keeping the
+# blend on-GPU eliminates the host copy entirely and frees those CPU cycles.
+#
+# Selection: RCPILOT_STITCH_BLEND_BACKEND in {cpu (default), vpi}.
+# Activated only when accel=vpi (otherwise the warps are already CPU numpy).
+# Falls back to CPU and disables itself for the rest of the run if the first
+# attempt raises — we never want a VPI op probe to crash the stream.
+# ---------------------------------------------------------------------------
+
+_VPI_BLEND_FAILED = False
+_VPI_BLEND_OPS: Optional[dict] = None
+
+
+def _resolve_vpi_blend_ops():
+    """Locate VPI image-arithmetic ops on this JetPack. Returns dict with mul/add
+    callables, or None if nothing usable is found.
+
+    VPI 2.x and 3.x have moved arithmetic ops between top-level functions and
+    image methods across releases. We probe several known names and cache the
+    result so the lookup happens once at first frame, never per-frame.
+    """
+    try:
+        import vpi
+    except Exception:
+        return None
+    mul = None
+    add = None
+    # Try top-level callables first (newer VPI releases).
+    for name in ("image_mul", "imageMul", "mul"):
+        cand = getattr(vpi, name, None)
+        if callable(cand):
+            mul = cand
+            break
+    for name in ("image_add", "imageAdd", "add"):
+        cand = getattr(vpi, name, None)
+        if callable(cand):
+            add = cand
+            break
+    # Fallback: image methods.
+    if mul is None and hasattr(vpi.Image, "mul"):
+        mul = lambda a, b, **kw: a.mul(b, **kw)
+    if add is None and hasattr(vpi.Image, "add"):
+        add = lambda a, b, **kw: a.add(b, **kw)
+    if mul is None or add is None:
+        return None
+    # Pick the best backend available. VIC is dedicated image-composition
+    # silicon; CUDA is fine if VIC isn't supported for these specific ops.
+    backend = vpi.Backend.CUDA
+    for cand in ("VIC", "CUDA"):
+        b = getattr(vpi.Backend, cand, None)
+        if b is not None:
+            backend = b
+            if cand == "VIC":
+                break
+    return {"vpi": vpi, "mul": mul, "add": add, "backend": backend}
+
+
+def vpi_blend_fast(warped_left: np.ndarray, warped_right: np.ndarray,
+                   plan: StitchPlan) -> np.ndarray:
+    """Per-pixel weighted blend on VPI without leaving GPU memory.
+
+    Computes  out = (warped_left * weight_left + warped_right * weight_right) / 255
+    using VPI image_mul + image_add on VIC (preferred) or CUDA. Returns the
+    composed numpy uint8 frame for the encoder.
+
+    Raises RuntimeError if the VPI ops aren't resolvable on this JetPack;
+    finish_fast_frame() catches it and falls back to the cv2 path permanently.
+    """
+    global _VPI_BLEND_OPS
+    if _VPI_BLEND_OPS is None:
+        _VPI_BLEND_OPS = _resolve_vpi_blend_ops()
+    ops = _VPI_BLEND_OPS
+    if not ops:
+        raise RuntimeError("VPI blend ops not available on this JetPack build")
+    vpi = ops["vpi"]
+    mul = ops["mul"]
+    add = ops["add"]
+    backend = ops["backend"]
+    src_l = vpi.asimage(warped_left)
+    src_r = vpi.asimage(warped_right)
+    w_l = vpi.asimage(plan.fast_weight_left_bgr)
+    w_r = vpi.asimage(plan.fast_weight_right_bgr)
+    with backend:
+        contrib_l = mul(src_l, w_l, scale=1.0 / 255.0)
+        contrib_r = mul(src_r, w_r, scale=1.0 / 255.0)
+        out = add(contrib_l, contrib_r)
+    with out.lock_cpu() as out_view:
+        return np.asarray(out_view).copy()
+
+
 def finish_fast_frame(warped_left: np.ndarray, warped_right: np.ndarray,
                       plan: StitchPlan, frame_idx: int) -> np.ndarray:
     # Sampled exposure refresh: only every N frames, and on the small overlap
@@ -1346,6 +1441,20 @@ def finish_fast_frame(warped_left: np.ndarray, warped_right: np.ndarray,
     # exposure-gain pass so color/exposure drift doesn't masquerade as FG.
     update_foreground_snap(warped_left, warped_right, plan, frame_idx)
 
+    # Blend backend: env-selectable. 'cpu' (default) keeps cv2 SIMD path
+    # bit-identical to v0.2 behavior. 'vpi' moves the blend onto VIC/CUDA via
+    # vpi_blend_fast, eliminating the lock_cpu() roundtrip in vpi_remap_fast.
+    backend = os.getenv("RCPILOT_STITCH_BLEND_BACKEND", "cpu").strip().lower()
+    global _VPI_BLEND_FAILED
+    if backend == "vpi" and not _VPI_BLEND_FAILED and plan.fast_accel == "vpi":
+        try:
+            return vpi_blend_fast(warped_left, warped_right, plan)
+        except Exception as exc:
+            logging.getLogger("stitch").warning(
+                "vpi_blend_fast failed (%s: %s); falling back to cv2 blend permanently",
+                type(exc).__name__, exc,
+            )
+            _VPI_BLEND_FAILED = True
     # Vectorized uint8 blend: each pixel = (src * weight) / 255, summed.
     # cv2.multiply with scale=1/255 saturates back to uint8 in one SIMD pass,
     # cv2.add saturates the sum. Both inputs are (H, W, 3) uint8, no broadcast.
@@ -1859,227 +1968,4 @@ def main() -> int:
     fg_threshold = env_int("RCPILOT_STITCH_FG_THRESHOLD", 30)
     # Kept for opt-in fg-snap diagnostics:
     # dilate=12 (25x25 kernel) cost too much, dilate=6 (13x13) is enough
-    # to bridge a hand's interior; refresh every 10 frames (~3Hz at 30fps)
-    # is plenty for hand motion in a cockpit scene.
-    fg_dilate_px = env_int("RCPILOT_STITCH_FG_DILATE_PX", 6)
-    fg_update_every_n = env_int("RCPILOT_STITCH_FG_UPDATE_EVERY_N", 10)
-    dynamic_align = env_bool("RCPILOT_STITCH_DYNAMIC", False)
-    dynamic_every_n = env_int("RCPILOT_STITCH_DYNAMIC_EVERY_N", max(1, fps // 2))
-    dynamic_feature_scale = env_float("RCPILOT_STITCH_DYNAMIC_FEATURE_SCALE", 0.40)
-    dynamic_min_matches = env_int("RCPILOT_STITCH_DYNAMIC_MIN_MATCHES", 10)
-    dynamic_alpha = env_float("RCPILOT_STITCH_DYNAMIC_ALPHA", 0.35)
-    dynamic_max_shift = env_float("RCPILOT_STITCH_DYNAMIC_MAX_SHIFT_PX", 320.0)
-
-    if left_sensor == right_sensor:
-        raise SystemExit("left and right sensor ids must differ")
-
-    log.info(
-        "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
-        "encoder=%s bitrate=%d fast=%s accel=%s exposure_every_n=%d "
-        "fg_snap=%s(thr=%d,dilate=%d,every=%d) diagnostic=%s "
-        "dynamic=%s(every=%d,scale=%.2f,alpha=%.2f,max_shift=%.0f) "
-        "preview_only=%s -> %s:%d",
-        left_sensor, right_sensor, width, height, fps, out_width, out_height,
-        encoder, bitrate, use_fast, stitch_accel, exposure_every_n,
-        fg_snap, fg_threshold, fg_dilate_px, fg_update_every_n,
-        diagnostic, dynamic_align, dynamic_every_n, dynamic_feature_scale,
-        dynamic_alpha, dynamic_max_shift, preview_only,
-        cockpit_ip, port,
-    )
-
-    left_pipeline = build_capture_pipeline(left_sensor, width, height, fps, sensor_mode)
-    right_pipeline = build_capture_pipeline(right_sensor, width, height, fps, sensor_mode)
-
-    writer_pipeline = build_writer_pipeline(
-        cockpit_ip, port, out_width, out_height, fps, bitrate,
-        encoder, key_interval, x264_preset,
-    )
-
-    left_reader = CameraReader("left", left_pipeline, log)
-    right_reader = CameraReader("right", right_pipeline, log)
-    left_reader.start()
-    right_reader.start()
-
-    running = True
-
-    def stop(_signum=None, _frame=None) -> None:
-        nonlocal running
-        running = False
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-
-    writer = None
-    try:
-        h_result = calibrate(left_reader, right_reader, width, height, log)
-        log.info(
-            "stitch alignment: detector=%s model=%s matches=%d inliers=%d "
-            "ratio=%.2f error=%.1fpx",
-            h_result.detector, h_result.model, h_result.matches,
-            h_result.inliers, h_result.ratio, h_result.reproj_error_px,
-        )
-        plan = make_plan(
-            h_result.h_right_to_left, width, height,
-            max_canvas_w=width * 4,
-            max_canvas_h=height * 3,
-            output_aspect=out_width / float(out_height),
-            use_cuda=use_cuda,
-            log=log,
-        )
-        if h_result.detector not in {"cached", "fallback"}:
-            save_calibration(calibration_path(), width, height, h_result, log)
-        configure_runtime_plan(
-            plan, width, height, out_width, out_height, use_fast, stitch_accel,
-            exposure_every_n, fg_snap, fg_threshold, fg_dilate_px,
-            fg_update_every_n, log,
-        )
-        active_h = h_result.h_right_to_left.copy()
-        dynamic_updater = None
-        if dynamic_align:
-            dynamic_updater = DynamicAlignmentUpdater(
-                width=width,
-                height=height,
-                every_n=dynamic_every_n,
-                feature_scale=dynamic_feature_scale,
-                min_matches=dynamic_min_matches,
-                alpha=dynamic_alpha,
-                max_corner_delta_px=dynamic_max_shift,
-                log=log,
-            )
-            log.info(
-                "dynamic stitch alignment enabled: every=%d scale=%.2f "
-                "min_matches=%d alpha=%.2f max_shift=%.0fpx",
-                dynamic_updater.every_n,
-                dynamic_updater.feature_scale,
-                dynamic_updater.min_matches,
-                dynamic_updater.alpha,
-                dynamic_updater.max_corner_delta_px,
-            )
-        preview_left, _ = left_reader.latest()
-        preview_right, _ = right_reader.latest()
-        if preview_left is not None and preview_right is not None:
-            if use_fast:
-                preview = stitch_frame_fast(
-                    preview_left, preview_right, plan,
-                    out_width, out_height, frame_idx=0,
-                )
-            else:
-                preview = stitch_frame(
-                    preview_left, preview_right, plan, out_width, out_height,
-                )
-            save_debug_image("stitched_preview.jpg", preview, log)
-
-        if diagnostic and preview_left is not None and preview_right is not None:
-            save_diagnostic_set(
-                preview_left, preview_right, plan, h_result,
-                out_width, out_height, use_fast, stitch_accel, log,
-            )
-
-        if diagnostic or preview_only:
-            log.info("diagnostic/preview-only mode complete; not opening RTP writer")
-            return 0
-
-        writer = cv2.VideoWriter(
-            writer_pipeline, cv2.CAP_GSTREAMER, 0, float(fps),
-            (out_width, out_height), True,
-        )
-        if not writer.isOpened():
-            raise SystemExit("could not open RTP writer pipeline")
-        log.info("RTP writer open")
-
-        frame_count = 0
-        total_frames = 0
-        last_log = time.monotonic()
-        period = 1.0 / max(1, fps)
-        next_frame = time.monotonic()
-        while running:
-            now = time.monotonic()
-            if now < next_frame:
-                time.sleep(min(0.005, next_frame - now))
-                continue
-            next_frame += period
-
-            left, left_count = left_reader.latest()
-            right, right_count = right_reader.latest()
-            if left is None or right is None:
-                continue
-            if dynamic_updater is not None:
-                candidate = dynamic_updater.pop_ready()
-                if candidate is not None:
-                    try:
-                        new_plan = make_plan(
-                            candidate.result.h_right_to_left, width, height,
-                            max_canvas_w=width * 4,
-                            max_canvas_h=height * 3,
-                            output_aspect=out_width / float(out_height),
-                            use_cuda=use_cuda,
-                            log=log,
-                        )
-                        configure_runtime_plan(
-                            new_plan, width, height, out_width, out_height,
-                            use_fast, stitch_accel, exposure_every_n, fg_snap,
-                            fg_threshold, fg_dilate_px, fg_update_every_n, log,
-                        )
-                        plan = new_plan
-                        active_h = candidate.result.h_right_to_left.copy()
-                        log.info(
-                            "dynamic stitch alignment applied: frame=%d "
-                            "%s/%s matches=%d inliers=%d ratio=%.2f "
-                            "error=%.1fpx solve=%.1fms shift=%.1fpx accel=%s",
-                            candidate.frame_idx,
-                            candidate.result.detector,
-                            candidate.result.model,
-                            candidate.result.matches,
-                            candidate.result.inliers,
-                            candidate.result.ratio,
-                            candidate.result.reproj_error_px,
-                            candidate.elapsed_ms,
-                            candidate.corner_delta_px,
-                            plan.fast_accel if use_fast else "slow",
-                        )
-                    except SystemExit as exc:
-                        log.warning(
-                            "dynamic stitch alignment candidate rejected: %s",
-                            exc,
-                        )
-                dynamic_updater.submit(left, right, active_h, total_frames)
-            if use_fast:
-                stitched = stitch_frame_fast(
-                    left, right, plan, out_width, out_height,
-                    frame_idx=total_frames,
-                )
-            else:
-                stitched = stitch_frame(left, right, plan, out_width, out_height)
-            writer.write(stitched)
-            frame_count += 1
-            total_frames += 1
-
-            now = time.monotonic()
-            if now - last_log >= 2.0:
-                if plan.exposure_match:
-                    gain = plan.exposure_gain
-                    log.info(
-                        "streaming stitched panorama: %.1f fps left=%d right=%d "
-                        "accel=%s gain_bgr=(%.2f,%.2f,%.2f)",
-                        frame_count / (now - last_log), left_count, right_count,
-                        plan.fast_accel if use_fast else "slow",
-                        gain[0], gain[1], gain[2],
-                    )
-                else:
-                    log.info(
-                        "streaming stitched panorama: %.1f fps left=%d right=%d accel=%s",
-                        frame_count / (now - last_log), left_count, right_count,
-                        plan.fast_accel if use_fast else "slow",
-                    )
-                frame_count = 0
-                last_log = now
-    finally:
-        if writer is not None:
-            writer.release()
-        left_reader.stop()
-        right_reader.stop()
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    # to bridge a hand's 

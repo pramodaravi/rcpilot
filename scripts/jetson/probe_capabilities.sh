@@ -165,21 +165,62 @@ try:
     arr[..., 1] = np.tile(np.linspace(0, 720, out_h, dtype=np.float32).reshape(-1, 1), (1, out_w))
 
     src = vpi.asimage(src_np)
+    out = vpi.Image((out_w, out_h), src.format)
     for _ in range(3):
         with vpi.Backend.CUDA:
-            out = src.remap(warpmap, interp=vpi.Interp.LINEAR)
-        out.cpu()
+            src.remap(warpmap, interp=vpi.Interp.LINEAR, out=out)
+        with out.lock_cpu():
+            pass
     n = 30
     t0 = time.perf_counter()
     for _ in range(n):
         with vpi.Backend.CUDA:
-            out = src.remap(warpmap, interp=vpi.Interp.LINEAR)
-        out.cpu()
+            src.remap(warpmap, interp=vpi.Interp.LINEAR, out=out)
+        with out.lock_cpu():
+            pass
     elapsed = (time.perf_counter() - t0) / n * 1000
     print(f"VPI CUDA remap (1280x720 -> 2560x720) round trip: {elapsed:.2f} ms/frame")
+
+    # Enumerate VPI blend-relevant ops so stitch_video.vpi_blend_fast knows
+    # what's actually available on this JetPack.
+    print()
+    print("VPI top-level ops (blend/composite/arithmetic candidates):")
+    callables = sorted(
+        n for n in dir(vpi)
+        if callable(getattr(vpi, n, None))
+        and not n.startswith("_")
+        and any(k in n.lower() for k in
+                ("blend", "compos", "mul", "add", "weight", "alpha", "arith", "convex"))
+    )
+    for n in callables:
+        print(f"  vpi.{n}")
+    img_methods = sorted(
+        m for m in dir(vpi.Image)
+        if not m.startswith("_")
+        and any(k in m.lower() for k in
+                ("blend", "compos", "mul", "add", "weight", "alpha", "arith", "convex"))
+    )
+    print(f"vpi.Image methods of interest:")
+    for m in img_methods:
+        print(f"  vpi.Image.{m}")
+    print()
+    backends = [name for name in dir(vpi.Backend)
+                if not name.startswith("_") and name.isupper()]
+    print(f"vpi.Backend members: {backends}")
 except Exception as e:
     print(f"VPI bench failed: {type(e).__name__}: {e}")
 PY
 
 echo
+
+echo
+echo "=== tegrastats snapshot (5 seconds at 500ms intervals) ==="
+if [ -x /usr/bin/tegrastats ]; then
+    /usr/bin/tegrastats --interval 500 --start
+    sleep 5
+    /usr/bin/tegrastats --stop
+else
+    echo "tegrastats not found"
+fi
+
 echo "=== done. tail -60 $LOG to see the result ==="
