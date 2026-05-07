@@ -51,8 +51,11 @@ sudo bash scripts/jetson/install_services.sh
 The video unit runs `scripts/jetson/start_video_stitched.sh`. The default mode
 is `RCPILOT_VIDEO_MODE=stitch`: one warped/blended panorama sent on UDP 5004.
 On JetPack this path defaults to `RCPILOT_STITCH_ACCEL=vpi`, using NVIDIA VPI
-CUDA remap for the per-frame image warps. Use `RCPILOT_VIDEO_MODE=native-sbs`
-only as a rescue/debug mode if you need to prove both CSI cameras are alive.
+CUDA remap for the per-frame image warps. It also enables
+`RCPILOT_STITCH_DYNAMIC=1`, which refreshes the alignment from live frame pairs
+in the background so camera flex or test-stand camera movement does not require
+a service restart. Use `RCPILOT_VIDEO_MODE=native-sbs` only as a rescue/debug
+mode if you need to prove both CSI cameras are alive.
 
 ## Cockpit — Windows
 

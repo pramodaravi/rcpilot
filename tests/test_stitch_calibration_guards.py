@@ -37,6 +37,25 @@ def _clear_stitch_env(monkeypatch):
             monkeypatch.delenv(var, raising=False)
 
 
+def test_blend_homography_smooths_live_updates():
+    current = sv.approximate_homography(1280, overlap_px=180)
+    target = current.copy()
+    target[0, 2] += 100.0
+
+    blended = sv.blend_homography(current, target, alpha=0.25)
+
+    assert blended[2, 2] == pytest.approx(1.0)
+    assert blended[0, 2] == pytest.approx(current[0, 2] + 25.0)
+
+
+def test_homography_corner_delta_reports_largest_corner_motion():
+    current = sv.approximate_homography(1280, overlap_px=180)
+    target = current.copy()
+    target[0, 2] += 42.0
+
+    assert sv.homography_corner_delta_px(current, target, 1280, 720) == pytest.approx(42.0)
+
+
 def _write_cache(tmp_path: Path, **overrides) -> Path:
     """Write a stitch_calibration.json with the named overrides on top of a
     plausible default. Returns the path."""
@@ -171,7 +190,7 @@ def test_bake_fast_path_raises_systemexit_on_singular_h_canvas():
     )
     plan.h_canvas = np.array(
         [[1.0, 1.0, 0.0],
-         [1.0, 1.0, 0.0],   # rank deficient — no third linearly independent row
+         [1.0, 1.0, 0.0],   # rank deficient - no third linearly independent row
          [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )

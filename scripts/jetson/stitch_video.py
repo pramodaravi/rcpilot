@@ -3,8 +3,8 @@
 
 This produces ONE RTP/H.264 video stream for Unity. It is a real image stitch:
 feature-based alignment, perspective warp, and feather blending. The alignment
-is estimated once at startup and cached, because the two cameras are rigidly
-mounted on the car.
+is estimated at startup and can be refreshed live when the camera rig flexes or
+the cameras are being moved during testing.
 
 The Jetson's useful acceleration here is its camera ISP, GStreamer/NVIDIA video
 path, VPI CUDA remap, and optional OpenCV CUDA remap if the installed OpenCV
@@ -231,7 +231,14 @@ class HomographyResult:
 
 def estimate_homography(left: np.ndarray, right: np.ndarray,
                         feature_scale: float, min_matches: int,
-                        log: logging.Logger) -> Optional[HomographyResult]:
+                        log: logging.Logger,
+                        warn: bool = True) -> Optional[HomographyResult]:
+    def note(message: str, *args) -> None:
+        if warn:
+            log.warning(message, *args)
+        else:
+            log.debug(message, *args)
+
     scale = float(np.clip(feature_scale, 0.25, 1.0))
     left_small = cv2.resize(left, None, fx=scale, fy=scale,
                             interpolation=cv2.INTER_AREA)
@@ -258,7 +265,7 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
     kp_l, des_l = detector.detectAndCompute(left_gray, None)
     kp_r, des_r = detector.detectAndCompute(right_gray, None)
     if des_l is None or des_r is None or len(kp_l) < 8 or len(kp_r) < 8:
-        log.warning("not enough features: left=%d right=%d", len(kp_l), len(kp_r))
+        note("not enough features: left=%d right=%d", len(kp_l), len(kp_r))
         return None
 
     if detector_name == "SIFT":
@@ -277,7 +284,7 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
             good.append(m)
 
     if len(good) < min_matches:
-        log.warning("not enough stitch matches: %d < %d", len(good), min_matches)
+        note("not enough stitch matches: %d < %d", len(good), min_matches)
         return None
 
     pts_r = np.float32([kp_r[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
@@ -303,13 +310,13 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
             pts_r, pts_l, cv2.RANSAC, ransacReprojThreshold=4.0
         )
     if h_small is None or mask is None:
-        log.warning("%s solve failed", model)
+        note("%s solve failed", model)
         return None
 
     inliers = int(mask.ravel().sum())
     min_inliers = env_int("RCPILOT_STITCH_MIN_INLIERS", max(6, min_matches - 2))
     if inliers < min_inliers:
-        log.warning("not enough stitch inliers: %d < %d", inliers, min_inliers)
+        note("not enough stitch inliers: %d < %d", inliers, min_inliers)
         return None
 
     # New as of 2026-05-04 after the singular-matrix crash loop: gate on
@@ -321,7 +328,7 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
     inlier_ratio = inliers / max(1, len(good))
     min_ratio = env_float("RCPILOT_STITCH_MIN_INLIER_RATIO", 0.30)
     if inlier_ratio < min_ratio:
-        log.warning(
+        note(
             "stitch inlier ratio too low: %.2f < %.2f (inliers=%d matches=%d)",
             inlier_ratio, min_ratio, inliers, len(good),
         )
@@ -335,14 +342,14 @@ def estimate_homography(left: np.ndarray, right: np.ndarray,
     # usually means RANSAC found a trivial identity-like model. Reject it
     # before it gets cached.
     if reproj_error_px <= 0.05:
-        log.warning(
+        note(
             "stitch reproj error suspiciously clean: %.3fpx (likely degenerate fit)",
             reproj_error_px,
         )
         return None
     max_reproj = env_float("RCPILOT_STITCH_MAX_REPROJ_ERROR_PX", 12.0)
     if reproj_error_px > max_reproj:
-        log.warning(
+        note(
             "%s reprojection error too high: %.1fpx > %.1fpx",
             model, reproj_error_px, max_reproj,
         )
@@ -362,6 +369,38 @@ def approximate_homography(width: int, overlap_px: int) -> np.ndarray:
     # not a true stitch, but still produces one blended widescreen frame.
     x = max(1, width - max(0, overlap_px))
     return np.array([[1.0, 0.0, float(x)], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def normalize_homography(h: np.ndarray) -> np.ndarray:
+    out = np.asarray(h, dtype=np.float64).copy()
+    denom = float(out[2, 2])
+    if abs(denom) > 1e-9:
+        out /= denom
+    return out
+
+
+def blend_homography(current: np.ndarray, target: np.ndarray,
+                     alpha: float) -> np.ndarray:
+    """Low-pass a live alignment update to avoid jittery remap swaps."""
+    a = float(np.clip(alpha, 0.0, 1.0))
+    if a >= 0.999:
+        return normalize_homography(target)
+    blended = normalize_homography(current) * (1.0 - a)
+    blended += normalize_homography(target) * a
+    return normalize_homography(blended)
+
+
+def homography_corner_delta_px(current: np.ndarray, target: np.ndarray,
+                               width: int, height: int) -> float:
+    corners = np.float32(
+        [[0, 0], [width, 0], [width, height], [0, height]]
+    ).reshape(-1, 1, 2)
+    try:
+        a = cv2.perspectiveTransform(corners, normalize_homography(current))
+        b = cv2.perspectiveTransform(corners, normalize_homography(target))
+    except cv2.error:
+        return float("inf")
+    return float(np.max(np.linalg.norm((b - a).reshape(-1, 2), axis=1)))
 
 
 def opencv_cuda_remap_available() -> bool:
@@ -537,6 +576,14 @@ class StitchPlan:
     fast_fg_timing_total_ms: float = 0.0
     fast_fg_timing_count: int = 0
     fast_fg_timing_last_log_frame: int = 0
+
+
+@dataclass
+class DynamicAlignmentCandidate:
+    result: HomographyResult
+    frame_idx: int
+    elapsed_ms: float
+    corner_delta_px: float
 
 
 def find_clean_crop(mask: np.ndarray,
@@ -963,6 +1010,122 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
         out_w, out_h, int((overlap_out > 0).sum()), plan.fast_exposure_every_n,
         plan.fast_accel,
     )
+
+
+def configure_runtime_plan(plan: StitchPlan, width: int, height: int,
+                           out_width: int, out_height: int,
+                           use_fast: bool, stitch_accel: str,
+                           exposure_every_n: int, fg_snap: bool,
+                           fg_threshold: int, fg_dilate_px: int,
+                           fg_update_every_n: int,
+                           log: logging.Logger) -> None:
+    plan.fast_exposure_every_n = max(0, exposure_every_n)
+    plan.fast_fg_snap = fg_snap
+    plan.fast_fg_threshold = max(1, fg_threshold)
+    plan.fast_fg_dilate_px = max(0, fg_dilate_px)
+    plan.fast_fg_update_every_n = max(1, fg_update_every_n)
+    if use_fast:
+        bake_fast_path(
+            plan, width, height, out_width, out_height, stitch_accel, log,
+        )
+
+
+class DynamicAlignmentUpdater:
+    """Estimate live camera-to-camera alignment without blocking video frames."""
+
+    def __init__(self, width: int, height: int, every_n: int,
+                 feature_scale: float, min_matches: int, alpha: float,
+                 max_corner_delta_px: float, log: logging.Logger):
+        self.width = width
+        self.height = height
+        self.every_n = max(1, every_n)
+        self.feature_scale = float(np.clip(feature_scale, 0.25, 1.0))
+        self.min_matches = max(6, min_matches)
+        self.alpha = float(np.clip(alpha, 0.0, 1.0))
+        self.max_corner_delta_px = max(0.0, max_corner_delta_px)
+        self.log = log
+        self._lock = threading.Lock()
+        self._worker: Optional[threading.Thread] = None
+        self._pending: Optional[DynamicAlignmentCandidate] = None
+        self._last_submit_frame = -self.every_n
+        self._last_fail_log = 0.0
+
+    def submit(self, left: np.ndarray, right: np.ndarray,
+               current_h: np.ndarray, frame_idx: int) -> bool:
+        if frame_idx - self._last_submit_frame < self.every_n:
+            return False
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return False
+            self._last_submit_frame = frame_idx
+            self._worker = threading.Thread(
+                target=self._run,
+                args=(left.copy(), right.copy(), current_h.copy(), frame_idx),
+                name="dynamic-stitch-align",
+                daemon=True,
+            )
+            self._worker.start()
+            return True
+
+    def pop_ready(self) -> Optional[DynamicAlignmentCandidate]:
+        with self._lock:
+            candidate = self._pending
+            self._pending = None
+            return candidate
+
+    def _log_failure(self, message: str, *args) -> None:
+        now = time.monotonic()
+        if now - self._last_fail_log >= 2.0:
+            self.log.warning(message, *args)
+            self._last_fail_log = now
+        else:
+            self.log.debug(message, *args)
+
+    def _run(self, left: np.ndarray, right: np.ndarray,
+             current_h: np.ndarray, frame_idx: int) -> None:
+        started = time.monotonic()
+        try:
+            result = estimate_homography(
+                left, right, self.feature_scale, self.min_matches, self.log,
+                warn=False,
+            )
+            if result is None:
+                return
+            smoothed_h = blend_homography(
+                current_h, result.h_right_to_left, self.alpha,
+            )
+            corner_delta = homography_corner_delta_px(
+                current_h, smoothed_h, self.width, self.height,
+            )
+            if (
+                self.max_corner_delta_px > 0.0
+                and corner_delta > self.max_corner_delta_px
+            ):
+                self._log_failure(
+                    "dynamic alignment rejected: corner shift %.1fpx > %.1fpx",
+                    corner_delta, self.max_corner_delta_px,
+                )
+                return
+            candidate = DynamicAlignmentCandidate(
+                result=HomographyResult(
+                    smoothed_h,
+                    result.inliers,
+                    result.matches,
+                    f"dynamic-{result.detector}",
+                    model=result.model,
+                    reproj_error_px=result.reproj_error_px,
+                ),
+                frame_idx=frame_idx,
+                elapsed_ms=(time.monotonic() - started) * 1000.0,
+                corner_delta_px=corner_delta,
+            )
+            with self._lock:
+                self._pending = candidate
+        except Exception as exc:
+            self._log_failure(
+                "dynamic alignment worker failed (%s: %s)",
+                type(exc).__name__, exc,
+            )
 
 
 def _resolve_seg_provider():
@@ -1700,6 +1863,12 @@ def main() -> int:
     # is plenty for hand motion in a cockpit scene.
     fg_dilate_px = env_int("RCPILOT_STITCH_FG_DILATE_PX", 6)
     fg_update_every_n = env_int("RCPILOT_STITCH_FG_UPDATE_EVERY_N", 10)
+    dynamic_align = env_bool("RCPILOT_STITCH_DYNAMIC", False)
+    dynamic_every_n = env_int("RCPILOT_STITCH_DYNAMIC_EVERY_N", max(1, fps // 2))
+    dynamic_feature_scale = env_float("RCPILOT_STITCH_DYNAMIC_FEATURE_SCALE", 0.40)
+    dynamic_min_matches = env_int("RCPILOT_STITCH_DYNAMIC_MIN_MATCHES", 10)
+    dynamic_alpha = env_float("RCPILOT_STITCH_DYNAMIC_ALPHA", 0.35)
+    dynamic_max_shift = env_float("RCPILOT_STITCH_DYNAMIC_MAX_SHIFT_PX", 320.0)
 
     if left_sensor == right_sensor:
         raise SystemExit("left and right sensor ids must differ")
@@ -1708,11 +1877,13 @@ def main() -> int:
         "real stitch sender: sensors %d/%d capture=%dx%d@%d output=%dx%d "
         "encoder=%s bitrate=%d fast=%s accel=%s exposure_every_n=%d "
         "fg_snap=%s(thr=%d,dilate=%d,every=%d) diagnostic=%s "
+        "dynamic=%s(every=%d,scale=%.2f,alpha=%.2f,max_shift=%.0f) "
         "preview_only=%s -> %s:%d",
         left_sensor, right_sensor, width, height, fps, out_width, out_height,
         encoder, bitrate, use_fast, stitch_accel, exposure_every_n,
         fg_snap, fg_threshold, fg_dilate_px, fg_update_every_n,
-        diagnostic, preview_only,
+        diagnostic, dynamic_align, dynamic_every_n, dynamic_feature_scale,
+        dynamic_alpha, dynamic_max_shift, preview_only,
         cockpit_ip, port,
     )
 
@@ -1757,14 +1928,32 @@ def main() -> int:
         )
         if h_result.detector not in {"cached", "fallback"}:
             save_calibration(calibration_path(), width, height, h_result, log)
-        plan.fast_exposure_every_n = max(0, exposure_every_n)
-        plan.fast_fg_snap = fg_snap
-        plan.fast_fg_threshold = max(1, fg_threshold)
-        plan.fast_fg_dilate_px = max(0, fg_dilate_px)
-        plan.fast_fg_update_every_n = max(1, fg_update_every_n)
-        if use_fast:
-            bake_fast_path(
-                plan, width, height, out_width, out_height, stitch_accel, log,
+        configure_runtime_plan(
+            plan, width, height, out_width, out_height, use_fast, stitch_accel,
+            exposure_every_n, fg_snap, fg_threshold, fg_dilate_px,
+            fg_update_every_n, log,
+        )
+        active_h = h_result.h_right_to_left.copy()
+        dynamic_updater = None
+        if dynamic_align:
+            dynamic_updater = DynamicAlignmentUpdater(
+                width=width,
+                height=height,
+                every_n=dynamic_every_n,
+                feature_scale=dynamic_feature_scale,
+                min_matches=dynamic_min_matches,
+                alpha=dynamic_alpha,
+                max_corner_delta_px=dynamic_max_shift,
+                log=log,
+            )
+            log.info(
+                "dynamic stitch alignment enabled: every=%d scale=%.2f "
+                "min_matches=%d alpha=%.2f max_shift=%.0fpx",
+                dynamic_updater.every_n,
+                dynamic_updater.feature_scale,
+                dynamic_updater.min_matches,
+                dynamic_updater.alpha,
+                dynamic_updater.max_corner_delta_px,
             )
         preview_left, _ = left_reader.latest()
         preview_right, _ = right_reader.latest()
@@ -1814,6 +2003,46 @@ def main() -> int:
             right, right_count = right_reader.latest()
             if left is None or right is None:
                 continue
+            if dynamic_updater is not None:
+                candidate = dynamic_updater.pop_ready()
+                if candidate is not None:
+                    try:
+                        new_plan = make_plan(
+                            candidate.result.h_right_to_left, width, height,
+                            max_canvas_w=width * 4,
+                            max_canvas_h=height * 3,
+                            output_aspect=out_width / float(out_height),
+                            use_cuda=use_cuda,
+                            log=log,
+                        )
+                        configure_runtime_plan(
+                            new_plan, width, height, out_width, out_height,
+                            use_fast, stitch_accel, exposure_every_n, fg_snap,
+                            fg_threshold, fg_dilate_px, fg_update_every_n, log,
+                        )
+                        plan = new_plan
+                        active_h = candidate.result.h_right_to_left.copy()
+                        log.info(
+                            "dynamic stitch alignment applied: frame=%d "
+                            "%s/%s matches=%d inliers=%d ratio=%.2f "
+                            "error=%.1fpx solve=%.1fms shift=%.1fpx accel=%s",
+                            candidate.frame_idx,
+                            candidate.result.detector,
+                            candidate.result.model,
+                            candidate.result.matches,
+                            candidate.result.inliers,
+                            candidate.result.ratio,
+                            candidate.result.reproj_error_px,
+                            candidate.elapsed_ms,
+                            candidate.corner_delta_px,
+                            plan.fast_accel if use_fast else "slow",
+                        )
+                    except SystemExit as exc:
+                        log.warning(
+                            "dynamic stitch alignment candidate rejected: %s",
+                            exc,
+                        )
+                dynamic_updater.submit(left, right, active_h, total_frames)
             if use_fast:
                 stitched = stitch_frame_fast(
                     left, right, plan, out_width, out_height,

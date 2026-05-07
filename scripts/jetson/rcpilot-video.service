@@ -29,6 +29,7 @@ Environment=RCPILOT_COCKPIT_IP=192.168.1.247
 Environment=RCPILOT_VIDEO_MODE=stitch
 Environment=RCPILOT_STITCH_ACCEL=vpi
 Environment=RCPILOT_STITCH_FAST=1
+Environment=RCPILOT_STITCH_DYNAMIC=1
 # Per-host config drop-in. Edit /etc/default/rcpilot-video to change
 # RCPILOT_VIDEO_MODE, RCPILOT_STITCH_ACCEL, RCPILOT_ENCODER, etc. without
 # `systemctl edit`. The leading `-` makes the file optional, so a Jetson

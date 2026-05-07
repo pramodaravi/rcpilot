@@ -33,7 +33,7 @@ full reasoning behind every choice. This file is the skim version.
 | Process | Host | Owner | Notes |
 | --- | --- | --- | --- |
 | `rcpilot-control-sender` | Cockpit | This repo | Reads HID joystick at 250 Hz, sends 32-byte UDP packets, measures RTT |
-| `start_video_stitched.sh` | Jetson (car) | This repo | Defaults to one Python panorama stitcher stream using NVIDIA camera capture plus VPI CUDA remap for warp/blend; `native-sbs` remains a rescue/debug mode |
+| `start_video_stitched.sh` | Jetson (car) | This repo | Defaults to one Python panorama stitcher stream using NVIDIA camera capture plus VPI CUDA remap for warp/blend and a live background matcher for camera-motion compensation; `native-sbs` remains a rescue/debug mode |
 | `rcpilot-echo-server` | Jetson (car) | This repo | Validates CRC, echoes for RTT, tracks last good packet |
 | Unity video bridge | Cockpit | This repo (script) | `bridge.py` decodes one already-merged RTP stream and forwards one wide texture to Unity |
 | pygame-ce | Cockpit | Third-party (vendored as wheel) | HID joystick abstraction |
