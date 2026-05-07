@@ -80,6 +80,4 @@ echo "Services installed and started. Check status with:"
 echo "  systemctl status rcpilot-echo"
 echo "  systemctl status rcpilot-video    # dual-cam stitched on UDP 5004"
 echo
-echo "To change runtime knobs without touching the unit file:"
-echo "  sudo \$EDITOR ${env_dst}"
-echo "  sudo systemctl restart rcpilot-video"
+echo

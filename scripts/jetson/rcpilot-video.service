@@ -1,5 +1,5 @@
 [Unit]
-Description=rcpilot dual-camera real panorama sender (IMX219 x2 -> warped/blended RTP H.264 -> cockpit)
+Description=rcpilot dual-camera video sender (IMX219 x2 -> RTP H.264 -> cockpit)
 Documentation=https://github.com/pramodaravi/rcpilot
 After=network-online.target
 Wants=network-online.target
@@ -20,20 +20,19 @@ WorkingDirectory=/home/adm2n/rcpilot
 # Cockpit IP for the Wi-Fi bench bring-up (Starlink subnet). This is the
 # unit-file default; /etc/default/rcpilot-video can override it without
 # touching the unit. If neither sets RCPILOT_COCKPIT_IP, start_video.sh
-# refuses to start (which is what we want — silently sending video to the
+# refuses to start (which is what we want -- silently sending video to the
 # wrong host is worse than a clear failure).
 Environment=RCPILOT_COCKPIT_IP=192.168.1.247
 # Per-host config drop-in. Edit /etc/default/rcpilot-video to change
-# RCPILOT_STITCH_SEG, RCPILOT_STITCH_ACCEL, RCPILOT_ENCODER, etc. without
+# RCPILOT_VIDEO_MODE, RCPILOT_STITCH_ACCEL, RCPILOT_ENCODER, etc. without
 # `systemctl edit`. The leading `-` makes the file optional, so a Jetson
 # that hasn't been re-installed since this change still boots fine using
 # only the unit-file Environment= defaults above.
 EnvironmentFile=-/etc/default/rcpilot-video
 ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video_stitched.sh
-# Restart only on actual process failure. The current Python stitcher exits
-# non-zero for camera/open/calibration failures, and exits cleanly on SIGTERM
-# so manual testing with `systemctl stop rcpilot-video` or `pkill` does not
-# immediately respawn a second camera owner.
+# Restart only on actual process failure. The wrapper defaults to native-sbs
+# for reliable live video; if opt-in stitch mode fails, systemd will restart
+# rather than silently leaving the cameras dead.
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal

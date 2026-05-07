@@ -54,6 +54,7 @@ echo "[install] sanity check - required GStreamer elements:"
 for element in \
     nvarguscamerasrc \
     nvvidconv \
+    nvcompositor \
     videoconvert \
     appsrc \
     appsink \
@@ -137,5 +138,5 @@ echo
 echo "[install] done."
 echo "  Activate with:    source ${VENV_DIR}/bin/activate"
 echo "  Run echo server:  rcpilot-echo-server -v"
-echo "  Run video sender: RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video.sh"
-echo "  Run AI stitcher:  RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"
+echo "  Run video sender: RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"
+echo "  Run stitcher:     RCPILOT_VIDEO_MODE=stitch RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"

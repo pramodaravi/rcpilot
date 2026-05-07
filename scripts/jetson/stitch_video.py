@@ -7,9 +7,10 @@ is estimated once at startup and cached, because the two cameras are rigidly
 mounted on the car.
 
 The Jetson's useful acceleration here is its camera ISP, GStreamer/NVIDIA video
-path, and optional OpenCV CUDA warp if the installed OpenCV build exposes it.
-The DLA/TOPS block is for neural inference; this stitcher avoids hallucinating
-missing scene content and only blends pixels the cameras actually see.
+path, VPI CUDA remap, and optional OpenCV CUDA remap if the installed OpenCV
+build exposes it. The DLA/TOPS block is for neural inference; this stitcher
+avoids hallucinating missing scene content and only blends pixels the cameras
+actually see.
 """
 
 from __future__ import annotations
@@ -515,7 +516,7 @@ class StitchPlan:
     # so closer objects appear at different output positions in each camera),
     # snap that pixel to ONE camera instead of feather-blending both. That
     # makes the hand visible once instead of as a ghosted double image.
-    fast_fg_snap: bool = True
+    fast_fg_snap: bool = False
     fast_fg_threshold: int = 30        # pixel-diff threshold to call FG
     fast_fg_dilate_px: int = 6         # FG mask dilation radius
     fast_fg_update_every_n: int = 10   # mask refresh cadence (frames)
@@ -660,13 +661,19 @@ def make_plan(h_right_to_left: np.ndarray, width: int, height: int,
 
     # Optional narrow-feather pass. Distance-transform feathering produces a
     # very wide blend zone, which makes parallax ghosting visible across the
-    # whole overlap. Setting RCPILOT_STITCH_FEATHER_PX clips the soft band
-    # to that many pixels around the seam (where left_distance == right_distance)
-    # and snaps everything outside the band to the nearer camera.
-    feather_px = env_int("RCPILOT_STITCH_FEATHER_PX", 8)
-    if feather_px > 0:
-        overlap_full = (left_mask > 0) & (right_mask > 0)
-        diff = left_distance - right_distance  # >0 = deeper into left
+    # whole overlap. RCPILOT_STITCH_FEATHER_PX clips the soft band to a few
+    # pixels around the seam; values <= 0 make the seam hard.
+    feather_px = env_int("RCPILOT_STITCH_FEATHER_PX", 4)
+    overlap_full = (left_mask > 0) & (right_mask > 0)
+    diff = left_distance - right_distance  # >0 = deeper into left
+    if feather_px <= 0:
+        snap_left = overlap_full & (diff >= 0)
+        snap_right = overlap_full & (diff < 0)
+        left_weight[snap_left] = 1.0
+        right_weight[snap_left] = 0.0
+        left_weight[snap_right] = 0.0
+        right_weight[snap_right] = 1.0
+    else:
         in_band = overlap_full & (np.abs(diff) < float(feather_px))
         far_overlap = overlap_full & ~in_band
         # Linear ramp across the band: at diff = -feather_px → all right,
@@ -923,11 +930,13 @@ def bake_fast_path(plan: StitchPlan, src_w: int, src_h: int,
                 import vpi
                 plan.fast_vpi_warp_left = build_vpi_warpmap(left_sx, left_sy)
                 plan.fast_vpi_warp_right = build_vpi_warpmap(rsx, rsy)
-                # Pre-allocate persistent output images. We don't know the
-                # exact format until the first asimage call, but VPI accepts
-                # 3-channel uint8 numpy as RGB8 by default — use that.
-                plan.fast_vpi_out_left = vpi.Image((out_w, out_h), vpi.Format.RGB8)
-                plan.fast_vpi_out_right = vpi.Image((out_w, out_h), vpi.Format.RGB8)
+                # Pre-allocate persistent output images with the same format
+                # vpi.asimage() assigns to our numpy camera frames.
+                src_format = vpi.asimage(
+                    np.empty((src_h, src_w, 3), dtype=np.uint8)
+                ).format
+                plan.fast_vpi_out_left = vpi.Image((out_w, out_h), src_format)
+                plan.fast_vpi_out_right = vpi.Image((out_w, out_h), src_format)
                 plan.fast_accel = "vpi"
             except Exception as exc:
                 log.warning("VPI warp map setup failed; trying next accel: %s", exc)
@@ -1683,9 +1692,9 @@ def main() -> int:
             f"got {stitch_accel!r}"
         )
     exposure_every_n = env_int("RCPILOT_STITCH_EXPOSURE_EVERY_N", 15)
-    fg_snap = env_bool("RCPILOT_STITCH_FG_SNAP", True)
+    fg_snap = env_bool("RCPILOT_STITCH_FG_SNAP", False)
     fg_threshold = env_int("RCPILOT_STITCH_FG_THRESHOLD", 30)
-    # Defaults tuned after measuring fg-snap perf on the bench Jetson:
+    # Kept for opt-in fg-snap diagnostics:
     # dilate=12 (25x25 kernel) cost too much, dilate=6 (13x13) is enough
     # to bridge a hand's interior; refresh every 10 frames (~3Hz at 30fps)
     # is plenty for hand motion in a cockpit scene.
