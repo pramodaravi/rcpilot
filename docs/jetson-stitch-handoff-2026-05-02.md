@@ -46,23 +46,25 @@ The user explicitly does not want two side-by-side feeds. They want one wide ima
 
 ## Runtime Architecture
 
-Manual stitched sender:
+Manual sender:
 
 ```bash
 RCPILOT_COCKPIT_IP=192.168.1.247 \
-RCPILOT_STITCH_RECALIBRATE=1 \
 bash scripts/jetson/start_video_stitched.sh
 ```
 
-The wrapper uses `/usr/bin/python3` by default so Jetson apt packages such as `python3-opencv` are visible.
+The wrapper now defaults to `RCPILOT_VIDEO_MODE=native-sbs`, which uses the
+native NVIDIA GStreamer path to keep both cameras visible even when the Python
+stitcher is unhappy. Use `RCPILOT_VIDEO_MODE=stitch` only after diagnostic
+captures look acceptable. Use `RCPILOT_VIDEO_MODE=auto` to try stitch first and
+fall back to native side-by-side if the stitcher exits non-zero.
 
 Pipeline shape:
 
 1. `nvarguscamerasrc` opens IMX219 sensor 0 and sensor 1.
-2. OpenCV calibrates alignment from frame pairs.
-3. Stitch plan builds crop, weights, and remap tables.
-4. Fast path remaps both camera frames into the final output frame.
-5. `x264enc` software encodes H.264 to RTP/UDP for Unity.
+2. Default mode uses `nvcompositor` to place both cameras into one wide frame.
+3. `x264enc` software encodes H.264 to RTP/UDP for Unity.
+4. Opt-in stitch mode uses OpenCV/VPI to calibrate, warp, blend, then encode.
 
 Important hardware note: NVIDIA documents that Jetson Orin Nano does not have NVENC. Do not spend time trying to force `nvv4l2h264enc` on this module. The useful acceleration path is camera ISP/VIC/GPU image processing where available; H.264 encode remains software x264.
 
@@ -95,8 +97,13 @@ In `scripts/jetson/stitch_video.py`:
   - `homography` is still available for comparison.
 - `RCPILOT_STITCH_MAX_REPROJ_ERROR_PX=12.0`
   - Rejects bad calibration solves.
-- `RCPILOT_STITCH_FEATHER_PX=8`
-  - Narrower feather to reduce ghosting/double images in the overlap.
+- `RCPILOT_STITCH_FEATHER_PX=4`
+  - Narrow seam crossfade to reduce ghosting/double images in the overlap.
+  - `0` is now a true hard seam.
+- `RCPILOT_STITCH_FG_SNAP=0` by default
+  - Foreground snap remains available for diagnostics, but it is opt-in
+    because it can smear/shimmer when the disagreement is calibration or
+    exposure instead of true foreground motion.
 - `RCPILOT_STITCH_KEEP_ASPECT=1`
   - Crops to the output aspect ratio before resize to avoid squeezing.
 - `RCPILOT_STITCH_ACCEL=auto`
@@ -105,6 +112,24 @@ In `scripts/jetson/stitch_video.py`:
   - Uses the pre-baked remap + uint8 blend path.
 
 ## Best Current Test Command
+
+First restore visible video:
+
+```bash
+cd ~/rcpilot
+git pull
+
+sudo systemctl stop rcpilot-video
+sudo pkill -f stitch_video.py || true
+sudo systemctl restart nvargus-daemon
+sleep 3
+
+RCPILOT_COCKPIT_IP=192.168.1.247 \
+RCPILOT_VIDEO_MODE=native-sbs \
+bash scripts/jetson/start_video_stitched.sh
+```
+
+Only after that works, test the opt-in stitcher:
 
 ```bash
 cd ~/rcpilot
@@ -118,10 +143,11 @@ sleep 3
 rm -f config/stitch_calibration.json
 
 RCPILOT_COCKPIT_IP=192.168.1.247 \
+RCPILOT_VIDEO_MODE=stitch \
 RCPILOT_STITCH_RECALIBRATE=1 \
 RCPILOT_STITCH_ACCEL=auto \
 RCPILOT_STITCH_MODEL=affine \
-RCPILOT_STITCH_FEATHER_PX=8 \
+RCPILOT_STITCH_FEATHER_PX=4 \
 bash scripts/jetson/start_video_stitched.sh
 ```
 
@@ -239,4 +265,3 @@ or:
 ```text
 [info] OpenCV CUDA remap not available (...); CPU fast path will be used
 ```
-

@@ -1,8 +1,9 @@
-"""RTP H.264 → raw RGB (default) or JPEG TCP bridge for the Unity driver station.
+"""RTP H.264 -> raw RGB (default) or JPEG TCP bridge for the Unity driver station.
 
-V1 is single-camera: the Jetson sends RTP H.264 to UDP 5004 (matches
-rcpilot/config/default.yaml on the Jetson). Unity's built-in H.264 decoding
-is flaky for live low-latency RTP, so this sidecar:
+The Jetson sends one RTP H.264 stream to UDP 5004. In hardware mode that
+stream is already merged from the Jetson camera pipeline by
+scripts/jetson/start_video_stitched.sh. Unity's built-in H.264 decoding is
+flaky for live low-latency RTP, so this sidecar:
 
     1. receives the RTP stream via PyAV (FFmpeg under the hood)
     2. drops old frames to keep latency bounded (~1 frame buffer)
@@ -20,9 +21,9 @@ Run:
 
 Or use bridge.sh / bridge.bat which set the same defaults.
 
-A second camera (chase view, etc.) is a future feature — to enable it later,
+A second independent stream is still possible for debug/chase-view work:
 launch a second copy on a distinct in-port + out-port pair, and set
-config.video.cam1Port in the Unity config.json to the new TCP port.
+config.video.cam1Port in Unity's config.json to the new TCP port.
 
 ## Why PyAV (was: OpenCV+GStreamer)
 
@@ -39,7 +40,7 @@ localhost latency.
 ## Latency budget
 
 camera shutter → cockpit pixel:
-    15 ms CSI+ISP + 3 ms NVENC + 5 ms wifi
+    15 ms CSI+ISP + 8 ms H.264 sender encode + 5 ms wifi
   + 4 ms depay/decode here + 5 ms re-encode
   + 3 ms TCP + 8 ms Unity upload + 8 ms vsync
   ≈ 50-60 ms at 60 fps. Fine for a 1,100 ft indoor kart loop.
@@ -330,7 +331,7 @@ def serve_one_client(conn: socket.socket, frame_box: dict, quality: int,
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--preset", choices=("lowlatency", "fast", "balanced", "quality"),
-                   default="lowlatency",
+                   default="fast",
                    help="quality preset: lowlatency/fast=640x360, "
                         "balanced=960x540, quality=1280x720 for a 720p input")
     p.add_argument("--in-port", type=int, default=5004,

@@ -36,13 +36,23 @@ source /opt/rcpilot/venv/bin/activate
 # Echo server (control packets in, echoes out)
 rcpilot-echo-server -v &
 
-# Video sender — Jetson → cockpit
-RCPILOT_COCKPIT_IP=192.168.55.100 bash scripts/jetson/start_video.sh
+# Dual-camera sender - Jetson -> cockpit
+RCPILOT_COCKPIT_IP=192.168.55.100 bash scripts/jetson/start_video_stitched.sh
 ```
 
 ### As a systemd service (production)
 
-The v0.1 codebase had a `rc-car.service` unit; we'll port it into `scripts/jetson/rcpilot.service` once the failsafe wiring is on the bench. For now, a `tmux` session or a manual `nohup` is sufficient — the watchdog logic in `echo_server.py` handles ungraceful exits.
+Install the echo and dual-camera panorama video services with:
+
+```bash
+sudo bash scripts/jetson/install_services.sh
+```
+
+The video unit runs `scripts/jetson/start_video_stitched.sh`. The default mode
+is `RCPILOT_VIDEO_MODE=stitch`: one warped/blended panorama sent on UDP 5004.
+On JetPack this path defaults to `RCPILOT_STITCH_ACCEL=vpi`, using NVIDIA VPI
+CUDA remap for the per-frame image warps. Use `RCPILOT_VIDEO_MODE=native-sbs`
+only as a rescue/debug mode if you need to prove both CSI cameras are alive.
 
 ## Cockpit — Windows
 

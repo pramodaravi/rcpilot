@@ -69,16 +69,16 @@ namespace RcPilot.Core
     public class VideoConfig
     {
         // The video-bridge/ sidecar decodes RTP H.264 from the Jetson and
-        // forwards JPEG frames over TCP to the cockpit. If the sidecar isn't
-        // running, the camera plane shows a "NO SIGNAL" static overlay — the
-        // rest of the app still works.
+        // forwards raw RGB frames over TCP by default (JPEG is only a fallback).
+        // If the sidecar is not running, the camera plane shows a "NO SIGNAL"
+        // static overlay and the rest of the app still works.
         //
-        // V1 uses one IMX219 camera. cam1Port is retained for the future
-        // dual-camera build (chase view); set it to 0 to disable.
+        // Hardware mode receives one already-stitched panorama. cam1Port is
+        // retained for legacy dual-stream benches and sim/chase views.
         public string bridgeHost = "127.0.0.1";
         public int cam0Port = 9000;
-        public int cam1Port = 0;            // V1: single camera; set >0 to enable cam1
-        public int texWidth = 1280;
+        public int cam1Port = 0;            // stitched sender uses one TCP bridge
+        public int texWidth = 2560;
         public int texHeight = 720;
     }
 

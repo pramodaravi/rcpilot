@@ -54,7 +54,7 @@ exec gst-launch-1.0 -e \
     nvcompositor name=comp \
         sink_0::xpos=0             sink_0::ypos=0 sink_0::width="${CAM_W}" sink_0::height="${CAM_H}" \
         sink_1::xpos="${RIGHT_XPOS}" sink_1::ypos=0 sink_1::width="${CAM_W}" sink_1::height="${CAM_H}" \
-    ! "video/x-raw(memory:NVMM),width=${OUT_W},height=${OUT_H},framerate=${FPS}/1,format=RGBA" \
+    ! "video/x-raw(memory:NVMM),width=${OUT_W},height=${OUT_H},framerate=${FPS}/1" \
     ! nvvidconv \
     ! "video/x-raw,format=I420,width=${OUT_W},height=${OUT_H},framerate=${FPS}/1" \
     ! queue leaky=downstream max-size-buffers=2 max-size-time=0 max-size-bytes=0 \

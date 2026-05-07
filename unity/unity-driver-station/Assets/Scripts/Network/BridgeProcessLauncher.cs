@@ -36,7 +36,7 @@ namespace RcPilot.Network
         [Header("Process control")]
         public bool autoStart = true;
         [Tooltip("video-bridge --preset value: lowlatency / fast / balanced / quality")]
-        public string preset = "lowlatency";
+        public string preset = "fast";
         [Tooltip("Show the bridge in its own console window. Default false: " +
                  "the bridge's stdout streams into Unity's Console instead.")]
         public bool showWindow = false;
@@ -44,7 +44,7 @@ namespace RcPilot.Network
         [Header("Bridge network")]
         [Tooltip("RTP/H.264 UDP port from the Jetson camera sender.")]
         public int inPort = 5004;
-        [Tooltip("JPEG-over-TCP port Unity connects to on localhost.")]
+        [Tooltip("Raw/JPEG-over-TCP port Unity connects to on localhost.")]
         public int outPort = 9000;
         [Tooltip("TCP bind address for Unity's bridge connection.")]
         public string tcpBind = "127.0.0.1";

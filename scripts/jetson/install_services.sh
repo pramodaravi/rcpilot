@@ -53,7 +53,7 @@ if [[ -f "$env_dst" ]]; then
     diff -u "$env_src" "$env_dst" 2>/dev/null | sed 's/^/    /' | head -40 || true
 else
     install -m 0644 "$env_src" "$env_dst"
-    echo "installed $env_dst (defaults — edit to enable RCPILOT_STITCH_SEG etc.)"
+    echo "installed $env_dst (stitched panorama defaults - edit for host tuning)"
 fi
 
 # rcpilot-video1.service is from the previous dual-stream architecture; remove
@@ -78,6 +78,6 @@ systemctl enable --now rcpilot-echo.service rcpilot-video.service
 echo
 echo "Services installed and started. Check status with:"
 echo "  systemctl status rcpilot-echo"
-echo "  systemctl status rcpilot-video    # dual-cam stitched on UDP 5004"
+echo "  systemctl status rcpilot-video    # stitched panorama on UDP 5004"
 echo
 echo

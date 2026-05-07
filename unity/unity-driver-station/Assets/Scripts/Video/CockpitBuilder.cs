@@ -4,11 +4,9 @@ using RcPilot.Core;
 namespace RcPilot.Video
 {
     /// <summary>
-    /// Procedurally constructs a dual-camera widescreen cockpit: two equal-sized
-    /// Quads side-by-side forming a wide "windshield" (left half = cam0, right
-    /// half = cam1), with the BuggyCockpit 3D model layered in front for the
-    /// dash + steering wheel. Each Quad has slight inward yaw so the seam looks
-    /// like a real curved windshield instead of a flat letterbox.
+    /// Procedurally constructs a widescreen cockpit: one ultra-wide Quad shows
+    /// the already-merged panorama produced on the Jetson, with the
+    /// BuggyCockpit 3D model layered in front for the dash + steering wheel.
     ///
     /// Camera feeds are Texture2D objects owned by this component; the
     /// VideoBridgeClient blits into them each frame, and the cockpit's unlit
@@ -43,6 +41,7 @@ namespace RcPilot.Video
         private Texture _cam1Source;
 
         private bool _cam0IsMain = true;
+        private bool _stitchedSingleFeed;
 
         public void Build(Config cfg)
         {
@@ -62,6 +61,7 @@ namespace RcPilot.Video
 
             _cam0Source = cam0Tex;
             _cam1Source = cam1Tex;
+            _stitchedSingleFeed = cfg.video.cam1Port <= 0;
 
             // Main camera
             var camGO = new GameObject("CockpitCamera");
@@ -85,8 +85,9 @@ namespace RcPilot.Video
 
             cockpitRoot = new GameObject("Cockpit");
 
-            // The Jetson stitches both IMX219 cameras into one 2560x720 stream
-            // via nvcompositor BEFORE encoding (see scripts/jetson/start_video_stitched.sh).
+            // The Jetson aligns/warps/blends both IMX219 cameras into one
+            // 2560x720 stream BEFORE encoding (see
+            // scripts/jetson/start_video_stitched.sh).
             // The cockpit therefore sees ONE wide video and renders it on a
             // single ultra-wide Quad — no shader gymnastics, no duplicated
             // middle. cam1Tex is no longer used (cam1Port = 0); ToggleMain
@@ -211,6 +212,13 @@ namespace RcPilot.Video
 
         public void ToggleMain()
         {
+            if (_stitchedSingleFeed)
+            {
+                RebindScreens();
+                Log.Info("Main camera = stitched panorama");
+                return;
+            }
+
             _cam0IsMain = !_cam0IsMain;
             RebindScreens();
             Log.Info($"Main camera = {(_cam0IsMain ? "cam0" : "cam1")}");
@@ -224,6 +232,12 @@ namespace RcPilot.Video
             if (mainScreenRenderer != null)
             {
                 var mat = mainScreenRenderer.material;
+                if (_stitchedSingleFeed)
+                {
+                    AssignMainTexture(mat, _cam0Source);
+                    return;
+                }
+
                 if (mat.HasProperty("_LeftTex"))
                 {
                     // Widescreen shader: left cam = cam0, right cam = cam1.

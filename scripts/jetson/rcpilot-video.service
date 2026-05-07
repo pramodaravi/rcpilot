@@ -23,6 +23,12 @@ WorkingDirectory=/home/adm2n/rcpilot
 # refuses to start (which is what we want -- silently sending video to the
 # wrong host is worse than a clear failure).
 Environment=RCPILOT_COCKPIT_IP=192.168.1.247
+# Default to one stitched panorama. The stitcher uses NVIDIA VPI CUDA remap on
+# JetPack when available; Orin Nano still uses software x264 because it has no
+# NVENC hardware encoder.
+Environment=RCPILOT_VIDEO_MODE=stitch
+Environment=RCPILOT_STITCH_ACCEL=vpi
+Environment=RCPILOT_STITCH_FAST=1
 # Per-host config drop-in. Edit /etc/default/rcpilot-video to change
 # RCPILOT_VIDEO_MODE, RCPILOT_STITCH_ACCEL, RCPILOT_ENCODER, etc. without
 # `systemctl edit`. The leading `-` makes the file optional, so a Jetson
@@ -30,9 +36,8 @@ Environment=RCPILOT_COCKPIT_IP=192.168.1.247
 # only the unit-file Environment= defaults above.
 EnvironmentFile=-/etc/default/rcpilot-video
 ExecStart=/usr/bin/bash /home/adm2n/rcpilot/scripts/jetson/start_video_stitched.sh
-# Restart only on actual process failure. The wrapper defaults to native-sbs
-# for reliable live video; if opt-in stitch mode fails, systemd will restart
-# rather than silently leaving the cameras dead.
+# Restart only on actual process failure. Use RCPILOT_VIDEO_MODE=auto when you
+# want stitch failures to fall back to native side-by-side instead.
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal

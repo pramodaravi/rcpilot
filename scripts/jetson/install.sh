@@ -138,5 +138,5 @@ echo
 echo "[install] done."
 echo "  Activate with:    source ${VENV_DIR}/bin/activate"
 echo "  Run echo server:  rcpilot-echo-server -v"
-echo "  Run video sender: RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"
-echo "  Run stitcher:     RCPILOT_VIDEO_MODE=stitch RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"
+echo "  Run stitcher:     RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"
+echo "  Rescue SBS:       RCPILOT_VIDEO_MODE=native-sbs RCPILOT_COCKPIT_IP=<cockpit-ip> bash ${REPO_ROOT}/scripts/jetson/start_video_stitched.sh"

@@ -131,12 +131,12 @@ namespace RcPilot.Core
                 // the launcher kills the bridge cleanly. Disable via
                 // BridgeProcessLauncher.autoStart=false in the Inspector if
                 // you want to launch the bridge manually for debugging.
-                // The Jetson stitches both IMX219 cameras into one 2560x720
-                // RTP stream via nvcompositor (start_video_stitched.sh), so
+                // The Jetson aligns/warps/blends both IMX219 cameras into one
+                // 2560x720 RTP stream via start_video_stitched.sh, so
                 // the cockpit only needs ONE bridge.py decoding the merged
                 // stream from UDP 5004. Set cam1Port > 0 only if you want to
                 // go back to the dual-stream architecture (see git history
-                // before the nvcompositor switch).
+                // before the single-stream stitcher).
                 var bridgeLauncher = gameObject.AddComponent<BridgeProcessLauncher>();
                 bridgeLauncher.jetsonIp = config.network.jetsonIp;
                 bridgeLauncher.outPort = config.video.cam0Port;
@@ -163,7 +163,7 @@ namespace RcPilot.Core
 
             if (!config.sim.enabled)
             {
-                // Dual-camera bench (cam1Port > 0): cam0 on UDP 5004 -> TCP 9000,
+                // Legacy dual-stream bench (cam1Port > 0): cam0 on UDP 5004 -> TCP 9000,
                 // cam1 on UDP 5006 -> TCP 9001. Each bridge.py is a separate
                 // sidecar process. Cockpit displays them side-by-side as a
                 // widescreen windshield — see CockpitBuilder.
